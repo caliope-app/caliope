@@ -1,0 +1,30 @@
+# Publishes a release when a tag such as v1.0.0 is pushed: runs the tests, builds the zip with the official
+# Node.js (which has npm and npx), checks that the zip starts the Azure DevOps MCP server with its own npx,
+# and only then publishes Caliope-windows-x64.zip, manifest.json and install.ps1.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Tests
+        run: node --test --test-concurrency=1 "test/*.test.js"
+      - name: Build the release files
+        run: node tools/package.mjs
+      - name: Check the zip and the install line on a PC without Node.js
+        run: node tools/release-check.mjs dist/Caliope-windows-x64.zip --install
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${{ github.ref_name }}" dist/Caliope-windows-x64.zip dist/manifest.json dist/install.ps1 --title "Caliope ${{ github.ref_name }}" --generate-notes

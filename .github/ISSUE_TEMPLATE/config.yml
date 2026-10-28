@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security problem
+    url: https://github.com/louisdegeestldg/caliope/security/advisories/new
+    about: Report it privately, not as a public issue.
+  - name: Docs
+    url: https://caliope.be/docs.html
+    about: How to install and use Caliope.

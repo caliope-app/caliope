@@ -1,0 +1,23 @@
+{
+  "name": "caliope",
+  "version": "1.0.1",
+  "private": true,
+  "license": "MIT",
+  "author": "Louis De Geest",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/louisdegeestldg/caliope"
+  },
+  "description": "An alternative to the GitHub Copilot app, for Windows.",
+  "type": "module",
+  "engines": {
+    "node": ">=22.15"
+  },
+  "scripts": {
+    "start": "node --use-system-ca server/main.js --open",
+    "serve": "node --use-system-ca server/main.js --stay",
+    "mock": "node tools/mock-copilot.js",
+    "test": "node --test --test-concurrency=1 \"test/*.test.js\"",
+    "package": "node tools/package.mjs"
+  }
+}

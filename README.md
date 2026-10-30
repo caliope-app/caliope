@@ -43,7 +43,8 @@ node tools/package.mjs --no-npm                    # test build in dist\
 ```
 
 - The tests run the real app against `tools/mock-copilot.js`, a fake Copilot API. A tag such as `[mock:edit notes.txt]` in a message picks a scenario.
-- To release, commit the new version in `package.json` and push a tag `v<version>`. The release workflow tests, builds and installs the zip before it publishes.
+- To release, commit the new version in `package.json` and push a tag `v<version>`. The release workflow tests, builds and installs the zip with the newest Node.js 26 before it publishes.
+- A daily workflow does this by itself when Node.js has a security release.
 
 ## Good to know
 

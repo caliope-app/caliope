@@ -8,13 +8,18 @@ import { execFile } from 'node:child_process';
 import { applyProxy, validateProxyUrl, parseInternetSettings } from '../server/proxy.js';
 import { commandEnvironment } from '../server/tools/shell.js';
 
-// A proxy that tunnels to the origin server for one made-up host, and refuses everything else.
+// A proxy that serves one made-up host from the origin server, and refuses everything else. It tunnels
+// https://. A plain http:// request comes in whole on Node.js 26 and as a tunnel on older versions.
 const seen = [];
 const origin = http.createServer((request, response) => response.end(`origin ${request.url}`));
 const proxy = http.createServer((request, response) => {
   seen.push(`GET ${request.url}`);
-  response.writeHead(403);
-  response.end();
+  if (!request.url.startsWith('http://copilot.caliope.test/')) {
+    response.writeHead(403);
+    response.end();
+    return;
+  }
+  response.end(`origin ${new URL(request.url).pathname}`);
 });
 proxy.on('connect', (request, socket, head) => {
   seen.push(`CONNECT ${request.url}`);
@@ -48,7 +53,11 @@ test('the proxy from Settings carries Caliope\'s requests and those of the progr
   assert.deepEqual(applyProxy({ proxy: proxyUrl, noProxy: '.company.local' }), { source: 'settings', url: proxyUrl, unsupported: false });
   assert.equal(await (await fetch('http://copilot.caliope.test/models')).text(), 'origin /models');
   assert.equal(await (await fetch(`http://127.0.0.1:${origin.address().port}/direct`)).text(), 'origin /direct');
-  assert.deepEqual(seen, ['CONNECT copilot.caliope.test:80'], 'the request to 127.0.0.1 did not go through the proxy');
+  assert.equal(seen.length, 1, 'the request to 127.0.0.1 did not go through the proxy');
+  assert.match(seen[0], /copilot\.caliope\.test/);
+  // Caliope's own requests are https:// and go through a tunnel. The test origin has no TLS, so this one fails.
+  await assert.rejects(fetch('https://copilot.caliope.test/secure'));
+  assert.equal(seen.at(-1), 'CONNECT copilot.caliope.test:443');
 
   const env = commandEnvironment([]);
   assert.equal(env.HTTPS_PROXY, proxyUrl);

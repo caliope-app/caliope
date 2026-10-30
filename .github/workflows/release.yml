@@ -1,11 +1,19 @@
 # Publishes a release when a tag such as v1.0.0 is pushed: runs the tests, builds the zip with the official
 # Node.js (which has npm and npx), checks that the zip starts the Azure DevOps MCP server with its own npx,
 # and only then publishes Caliope-windows-x64.zip, manifest.json and install.ps1.
+# node-security.yml calls this with a Node.js version. It then also raises the patch version, and commits and
+# tags that only after the checks passed.
 name: Release
 
 on:
   push:
     tags: ['v*']
+  workflow_call:
+    inputs:
+      node:
+        description: The exact Node.js version to build with
+        type: string
+        required: true
 
 permissions:
   contents: write
@@ -17,14 +25,31 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: '24'
+          # Without check-latest the runner's cached Node.js is used, which can be behind.
+          node-version: ${{ inputs.node || '26' }}
+          check-latest: true
+      - name: Raise the patch version
+        if: inputs.node
+        run: npm version patch --no-git-tag-version
       - name: Tests
         run: node --test --test-concurrency=1 "test/*.test.js"
       - name: Build the release files
         run: node tools/package.mjs
       - name: Check the zip and the install line on a PC without Node.js
         run: node tools/release-check.mjs dist/Caliope-windows-x64.zip --install
+      - name: Commit and tag the new version
+        if: inputs.node
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -am "Caliope $version"
+          git tag "v$version"
+          git push origin HEAD:main "v$version"
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "${{ github.ref_name }}" dist/Caliope-windows-x64.zip dist/manifest.json dist/install.ps1 --title "Caliope ${{ github.ref_name }}" --generate-notes
+        run: |
+          $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          gh release create "v$version" dist/Caliope-windows-x64.zip dist/manifest.json dist/install.ps1 --title "Caliope v$version" --generate-notes

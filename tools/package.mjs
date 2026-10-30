@@ -1,6 +1,7 @@
 // Builds the release files in dist/, with the same names for every version:
 //   Caliope-windows-x64.zip  the app with Node.js inside (its files at the root of the zip)
-//   manifest.json            version, size and SHA-256 of the zip, read by install.ps1 and the update check
+//   manifest.json            version, Node.js version, size and SHA-256 of the zip, read by install.ps1, the
+//                            update check and .github/workflows/node-security.yml
 //   install.ps1              the one-line installer, with this repository's releases address filled in
 // .github/workflows/release.yml runs this for a v<version> tag and publishes the three files (see README.md).
 // - runtime\ gets node.exe plus npm and npx from next to it, as the official Node.js download has them, so
@@ -62,7 +63,7 @@ fs.writeFileSync(path.join(dist, 'install.ps1'), installer);
 const zip = path.join(dist, ZIP_NAME);
 execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', `Compress-Archive -Path '${path.join(staging, '*').replace(/'/g, "''")}' -DestinationPath '${zip.replace(/'/g, "''")}' -CompressionLevel Optimal`], { stdio: 'inherit' });
 const bytes = fs.readFileSync(zip);
-const manifest = { version, files: { [ZIP_NAME]: { sha256: crypto.createHash('sha256').update(bytes).digest('hex'), size: bytes.length } } };
+const manifest = { version, node: process.versions.node, files: { [ZIP_NAME]: { sha256: crypto.createHash('sha256').update(bytes).digest('hex'), size: bytes.length } } };
 fs.writeFileSync(path.join(dist, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`);
 fs.rmSync(staging, { recursive: true, force: true });
 console.log(`Release ${version}: ${zip} (${(bytes.length / 1024 / 1024).toFixed(1)} MB), manifest.json, install.ps1`);

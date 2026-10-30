@@ -130,7 +130,44 @@ export async function renderPdfPages(file, { first, last, width = 1200 }) {
   return result;
 }
 
+// CryptProtectData and CryptUnprotectData take the same arguments.
+const DPAPI_SIGNATURE = { return: 'int32', arguments: ['buffer', 'pointer', 'pointer', 'pointer', 'pointer', 'uint32', 'buffer'] };
+const CRYPTPROTECT_UI_FORBIDDEN = 1;
+
+/**
+ * Encrypt or decrypt a Buffer for this Windows user, inside this process.
+ * - `name`: CryptProtectData or CryptUnprotectData.
+ * - Returns a Buffer, or null when this Node.js has no node:ffi (older than 26.1, only when running from source).
+ * - Throws when Windows refuses, for example for data of another Windows user.
+ * - Security software flags PowerShell that decrypts DPAPI data, because credential stealers do that.
+ */
+export async function callDpapi(name, input) {
+  const ffi = await import('node:ffi').catch(() => null);
+  if (!ffi) return null;
+  const crypt32 = ffi.dlopen('crypt32.dll', { [name]: DPAPI_SIGNATURE });
+  const kernel32 = ffi.dlopen('kernel32.dll', { LocalFree: { return: 'pointer', arguments: ['pointer'] } });
+  // Buffer.alloc gives memory of its own: a small Buffer.from can share a pool, at an offset.
+  const inputBytes = Buffer.alloc(input.length);
+  input.copy(inputBytes);
+  // A DATA_BLOB on 64-bit Windows: the size at byte 0 and the address at byte 8.
+  const inputBlob = Buffer.alloc(16);
+  inputBlob.writeUInt32LE(inputBytes.length, 0);
+  inputBlob.writeBigUInt64LE(ffi.getRawPointer(inputBytes), 8);
+  const outputBlob = Buffer.alloc(16);
+  const succeeded = crypt32.functions[name](inputBlob, null, null, null, null, CRYPTPROTECT_UI_FORBIDDEN, outputBlob);
+  if (!succeeded) throw new Error(`${name} failed.`);
+  const outputAddress = outputBlob.readBigUInt64LE(8);
+  const output = ffi.toBuffer(outputAddress, outputBlob.readUInt32LE(0));
+  kernel32.functions.LocalFree(outputAddress);
+  return output;
+}
+
 export async function protectSecret(plainText) {
+  const encrypted = await callDpapi('CryptProtectData', Buffer.from(plainText, 'utf8'));
+  if (encrypted) {
+    const encryptedText = encrypted.toString('base64');
+    return encryptedText;
+  }
   const script = [
     'Add-Type -AssemblyName System.Security',
     '$plain = [Console]::In.ReadToEnd()',
@@ -143,6 +180,11 @@ export async function protectSecret(plainText) {
 }
 
 export async function unprotectSecret(protectedBase64) {
+  const decrypted = await callDpapi('CryptUnprotectData', Buffer.from(protectedBase64, 'base64'));
+  if (decrypted) {
+    const decryptedText = decrypted.toString('utf8');
+    return decryptedText;
+  }
   const script = [
     'Add-Type -AssemblyName System.Security',
     '$encoded = [Console]::In.ReadToEnd().Trim()',

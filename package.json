@@ -1,12 +1,12 @@
 {
   "name": "caliope",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "private": true,
   "license": "MIT",
   "author": "Louis De Geest",
   "repository": {
     "type": "git",
-    "url": "https://github.com/louisdegeestldg/caliope"
+    "url": "https://github.com/caliope-app/caliope"
   },
   "description": "An alternative to the GitHub Copilot app, for Windows.",
   "type": "module",

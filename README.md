@@ -23,11 +23,11 @@ An open-source alternative to the GitHub Copilot app, for Windows. It works in y
 Paste this into PowerShell:
 
 ```powershell
-irm https://github.com/louisdegeestldg/caliope/releases/latest/download/install.ps1 | iex
+irm https://github.com/caliope-app/caliope/releases/latest/download/install.ps1 | iex
 ```
 
 - Needs 64-bit Windows 10 or 11, Chrome or Edge, and a Copilot plan (Pro, Pro+, Business or Enterprise). The Changes panel, commits, pull requests and worktrees also need git.
-- Line blocked? Download `Caliope-windows-x64.zip` from the [latest release](https://github.com/louisdegeestldg/caliope/releases/latest), unzip it and run `Caliope.cmd`.
+- Line blocked? Download `Caliope-windows-x64.zip` from the [latest release](https://github.com/caliope-app/caliope/releases/latest), unzip it and run `Caliope.cmd`.
 - Caliope tells you when an update is out and installs it with one click, or by itself if you turn that on in Settings. Uninstall in Windows Settings → Apps. Your sessions stay in `%LOCALAPPDATA%\Caliope` until you delete that folder.
 
 How to use it: [the docs](https://caliope.be/docs.html).

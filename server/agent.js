@@ -7,7 +7,7 @@ import { AuthError } from './auth.js';
 import { isThinkingSignatureError, omitThinkingBlocks } from './protocol-anthropic.js';
 import { protocolFor } from './protocols.js';
 import { getTool, toolSpecsFor, toolNamesForNewSession, validateToolInput } from './tools/index.js';
-import { killProcessTree } from './windows.js';
+import { effectiveShell, stopJob } from './tools/shell.js';
 import { ToolInputError, formatBytes } from './tools/fs-tools.js';
 import { profileForFolder } from './tools/browser.js';
 import { projectRoot } from './tools/files.js';
@@ -51,8 +51,16 @@ const TOOL_OUTPUT_FLUSH_MS = 120;
 // File tools after whose first use in a subfolder the agent gets that folder's instruction files.
 const FOLDER_INSTRUCTION_TOOLS = new Set(['read_file', 'edit_file', 'write_file', 'notebook_edit']);
 
-/** The project reached its monthly AI-credit limit. */
-class SpendingLimitError extends Error {}
+/**
+ * A spending limit was reached.
+ * - `project`: the folder whose project page raises the limit; undefined for the limit in Settings.
+ */
+class SpendingLimitError extends Error {
+  constructor(message, project) {
+    super(message);
+    this.project = project;
+  }
+}
 
 export class AgentManager {
   constructor({ config, settings, store, client, auth, hub, log, ledger, browser, mcp, projects }) {
@@ -68,7 +76,9 @@ export class AgentManager {
     this.log = log;
     this.ledger = ledger;
     this.runners = new Map();
-    this.adaptations = new Map();
+    // The month a session last said that requests without a reported cost keep a spending limit from being
+    // fully enforced. Kept for the whole app, so the notice comes once a month, not in every session.
+    this.unpricedNoticeMonth = null;
     this.allowance = null;
     this.allowanceError = null;
     this.allowanceFetchedAt = 0;
@@ -237,20 +247,17 @@ export class AgentManager {
     return model?.protocol ? model : null;
   }
 
+  /** The optional fields Copilot refused for a model; the client keeps and saves them. */
   adaptationsFor(modelId) {
-    let adaptations = this.adaptations.get(modelId);
-    if (!adaptations) {
-      adaptations = {};
-      this.adaptations.set(modelId, adaptations);
-    }
-    return adaptations;
+    return this.client.adaptationsFor(modelId);
   }
 
   /**
    * New session in `cwd`. With `worktree`, the session works on its own branch in a separate git
    * worktree, so parallel sessions in one repository don't touch each other's files.
+   * - `model` and `effort`: picked for this session before it started. Without them, the defaults for the mode.
    */
-  async createSession({ cwd, mode, worktree = false, trust = undefined }) {
+  async createSession({ cwd, mode, worktree = false, trust = undefined, model = null, effort = null }) {
     if (isInside(cwd, this.config.dataDir) || isInside(this.config.dataDir, cwd)) {
       throw new ToolInputError('Choose a project folder that does not contain Caliope\'s own data folder.');
     }
@@ -284,8 +291,8 @@ export class AgentManager {
       session = await this.store.create({
         cwd: workTree ? workTree.cwd : cwd,
         mode: chosenMode,
-        model: this.defaultModelId(planning ? 'plan' : 'build'),
-        effort: planning ? settings.planEffort : settings.buildEffort,
+        model: model || this.defaultModelId(planning ? 'plan' : 'build'),
+        effort: effort || (planning ? settings.planEffort : settings.buildEffort),
         worktree: workTree,
       });
     } catch (error) {
@@ -367,33 +374,61 @@ export class AgentManager {
   }
 
   /**
-   * Before the agent or a subagent calls the model: the project's monthly limit, set on the project page.
-   * - At the limit it throws, so the turn stops with an error. Retry continues once the limit is raised.
-   * - From 80% the session shows a notice, once per month.
-   * - A scheduled task's run also stops at the task's own limit.
+   * Before the agent or a subagent calls the model: the spending limits.
+   * - The project's monthly limit (project page), the monthly limit for all of Caliope (Settings), and a
+   *   scheduled task's limit per run.
+   * - At a limit it throws, so the turn stops with an error. Retry continues once the limit is raised.
+   * - From 80% of a monthly limit the session shows a notice, once per month for each limit (see checkMonthlyLimit).
+   * - Requests Copilot reported no cost for cannot count towards a limit. When a limit has them, a session
+   *   says that the limit cannot be fully enforced, once per month for the whole app.
    */
   checkSpendingLimit(session) {
     const folder = projectFolderOf(session.meta);
     const { creditLimit, schedules } = this.projects.get(folder);
+    const unpricedLimits = [];
     // The task's current limit, so raising it on the project page lets Retry continue. A reminder or loop
     // running in an existing session counts from where it started. A run in a new session counts from zero.
     const run = session.data.scheduledRun || session.meta.schedule;
     const runLimit = run ? (schedules.find((task) => task.id === run.id)?.maxCredits ?? run.maxCredits) : 0;
-    const runSpent = (session.meta.usage.nanoAiu - (run?.fromNanoAiu || 0)) / NANO_AIU_PER_CREDIT;
-    if (runLimit && runSpent >= runLimit) {
-      throw new SpendingLimitError(`This run of the scheduled task "${run.name}" reached its limit of ${runLimit} AI credits. Raise it on the project page, then press Retry.`);
-    }
-    if (!creditLimit) return;
-    const spent = this.ledger.projectSpendThisMonth(pathKey(folder)) / NANO_AIU_PER_CREDIT;
-    if (spent >= creditLimit) {
-      throw new SpendingLimitError(`This project reached its limit of ${creditLimit} AI credits for this month (${spent.toFixed(2)} spent). Raise the limit on the project page, then press Retry.`);
+    if (runLimit) {
+      const runSpent = (session.meta.usage.nanoAiu - (run.fromNanoAiu || 0)) / NANO_AIU_PER_CREDIT;
+      if (runSpent >= runLimit) {
+        throw new SpendingLimitError(`This run of the scheduled task "${run.name}" reached its limit of ${runLimit} AI credits. Raise it on the project page, then press Retry.`, folder);
+      }
+      if ((session.meta.usage.unpricedRequests || 0) > (run.fromUnpriced || 0)) unpricedLimits.push(`the limit per run of "${run.name}"`);
     }
     const now = new Date();
     const month = `${now.getFullYear()}-${now.getMonth() + 1}`;
-    if (spent >= creditLimit * 0.8 && session.meta.spendingNoticeMonth !== month) {
-      session.meta.spendingNoticeMonth = month;
-      this.appendEvent(session, { kind: 'notice', text: `This project has used ${Math.floor((spent / creditLimit) * 100)}% of its ${creditLimit} AI credits for this month.` });
+    if (this.checkMonthlyLimit(session, month, creditLimit, folder)) unpricedLimits.push('this project\'s monthly limit');
+    if (this.checkMonthlyLimit(session, month, this.settings.get().creditLimit)) unpricedLimits.push('the monthly limit in Settings');
+    if (unpricedLimits.length > 0 && this.unpricedNoticeMonth !== month) {
+      this.unpricedNoticeMonth = month;
+      const names = unpricedLimits.length > 1 ? `${unpricedLimits.slice(0, -1).join(', ')} and ${unpricedLimits.at(-1)}` : unpricedLimits[0];
+      this.appendEvent(session, { kind: 'notice', text: `Copilot reported no cost for some requests, so ${names} cannot be fully enforced: those requests are not counted.` });
     }
+  }
+
+  /**
+   * One monthly limit: the project's (`folder`), or without `folder` the one in Settings for all of Caliope.
+   * - Throws at the limit. From 80% the session shows a notice, once per month for each of the two limits.
+   * - Returns true when Copilot reported no cost for some of the requests this limit counts.
+   */
+  checkMonthlyLimit(session, month, credits, folder) {
+    if (!credits) return false;
+    const spend = this.ledger.spendThisMonth(folder ? pathKey(folder) : null);
+    const spent = spend.nanoAiu / NANO_AIU_PER_CREDIT;
+    const owner = folder ? 'This project' : 'Caliope';
+    if (spent >= credits) {
+      const raise = folder ? 'on the project page' : 'in Settings';
+      throw new SpendingLimitError(`${owner} reached its limit of ${credits} AI credits for this month (${spent.toFixed(2)} spent). Raise the limit ${raise}, then press Retry.`, folder);
+    }
+    const noticeMonth = folder ? 'spendingNoticeMonth' : 'settingsSpendingNoticeMonth';
+    if (spent >= credits * 0.8 && session.meta[noticeMonth] !== month) {
+      session.meta[noticeMonth] = month;
+      this.appendEvent(session, { kind: 'notice', text: `${owner} has used ${Math.floor((spent / credits) * 100)}% of its ${credits} AI credits for this month.` });
+    }
+    const unpriced = spend.unpricedRequests > 0;
+    return unpriced;
   }
 
   /**
@@ -417,6 +452,9 @@ export class AgentManager {
         return { request: { model, system, tools: [], hostedTools, history, effort: effortFor(model, effort), maxTokens: outputLimit, thinkingDisplay: 'omitted' } };
       },
       onUnfinished: (usage) => this.recordUsage(session, model, usage, kind),
+      onNotice: (text) => {
+        if (session) this.appendEvent(session, { kind: 'notice', text });
+      },
     });
     this.recordUsage(session, model, result.usage, kind);
     if (result.stopReason === 'refusal') throw new Error(`${model.name} declined the request.`);
@@ -437,17 +475,20 @@ export class AgentManager {
   async classifyCommand(session, { command, cwd, description, input = null, background = false, tool = null }, signal) {
     const lastRequest = session.data.messages.findLast((message) => message.role === 'user' && message.kind === 'prompt' && !message.auto);
     const request = lastRequest ? promptContent(lastRequest).text.slice(0, 2000) : '';
-    const cacheKey = `${request}\n${tool ? `${tool.server}/${tool.name}` : cwd}\n${command}\n${background}\n${input ?? ''}`;
+    // JSON keeps the parts apart: a folder name with a line break cannot make another command's key.
+    const cacheKey = JSON.stringify([request, tool ? `${tool.server}/${tool.name}` : cwd, command, background, input ?? '']);
     session.classifierCache = session.classifierCache || new Map();
     if (session.classifierCache.has(cacheKey)) return session.classifierCache.get(cacheKey);
     const modelId = this.defaultModelId('check') || session.meta.model;
+    // The check judges a command in the shell it really runs in: cmd.exe also in Constrained Language Mode.
+    const shell = await effectiveShell(this.settings.get().shell);
     let verdict;
     try {
       const text = await this.completeText({
         session,
         modelId,
         system: CLASSIFIER_SYSTEM,
-        prompt: classifierPrompt({ projectFolder: session.meta.cwd, cwd, shell: this.settings.get().shell, description, command, input, background, dataDir: this.config.dataDir, request, tool }),
+        prompt: classifierPrompt({ projectFolder: session.meta.cwd, cwd, shell, description, command, input, background, dataDir: this.config.dataDir, request, tool }),
         effort: 'low',
         kind: 'approval',
         signal,
@@ -501,7 +542,8 @@ export class AgentManager {
     let tailStart = messages.length;
     while (tailStart > 0 && (messages[tailStart - 1].role === 'event' || (messages[tailStart - 1].role === 'user' && messages[tailStart - 1].kind === 'prompt'))) tailStart--;
     // An explicit model (the GPT model that must read its own compaction), else the one from Settings, else the session's.
-    const model = modelId ? this.resolveModel(modelId) : this.compactionModel() || this.resolveModel(session.meta.model || this.defaultModelId(session.meta.mode === 'plan' ? 'plan' : 'build'));
+    const sessionModelId = session.meta.model || this.defaultModelId(session.meta.mode === 'plan' ? 'plan' : 'build');
+    const model = modelId ? this.resolveModel(modelId) : this.compactionModel() || this.resolveModel(sessionModelId);
     if (!model?.protocol) throw new Error('No Copilot model is available to write the summary.');
     const effort = this.settings.get().compactEffort || session.meta.effort;
     const earlier = messages.slice(0, tailStart);
@@ -566,6 +608,7 @@ export class AgentManager {
           return { request: summaryRequest };
         },
         onUnfinished: (usage) => this.recordUsage(session, model, usage, 'compact'),
+        onNotice: (text) => this.appendEvent(session, { kind: 'notice', text }),
       });
       this.recordUsage(session, model, result.usage, 'compact');
       const summary = result.content.filter((block) => block.type === 'text').map((block) => block.text).join('\n').trim();
@@ -748,7 +791,7 @@ class SessionRunner {
   /** Stop one background job, or all of them. */
   stopJobs(jobId = null) {
     for (const job of this.jobs.values()) {
-      if (job.running && (!jobId || job.id === jobId)) killProcessTree(job.pid);
+      if (job.running && (!jobId || job.id === jobId)) stopJob(job);
     }
   }
 
@@ -842,10 +885,37 @@ class SessionRunner {
   /** Run the agent again without a new message (after an error). */
   async retry() {
     const session = await this.manager.store.get(this.id);
+    if (!session) throw new ToolInputError('Session not found.');
     if (this.state === 'running') return;
     if (!this.manager.auth.status().signedIn) throw new AuthError('Sign in to GitHub Copilot first.');
     checkSessionFolder(session);
     this.start(session, []);
+  }
+
+  /**
+   * /compact between turns: the model summarizes the conversation now. Returns { ok, stopped }.
+   * - Stop, or a message sent with "Send now", stops it.
+   * - The message that interrupted it, or one queued while it ran, then starts a turn.
+   */
+  async compact(session, instructions) {
+    this.state = 'running';
+    this.abortController = new AbortController();
+    const signal = this.abortController.signal;
+    this.setStatus('compacting');
+    let stopped = false;
+    try {
+      await this.manager.compact(session, { instructions, reason: 'Compacted on request.', signal });
+    } catch (error) {
+      // Esc, or "interrupt and send", stops the compaction. That is not a failure.
+      if (!isAbortError(error) && !signal.aborted) throw error;
+      stopped = true;
+    } finally {
+      this.state = 'idle';
+      this.abortController = null;
+      this.setStatus(null);
+      this.startNext(session);
+    }
+    return { ok: !stopped, stopped };
   }
 
   /** Start a turn with these messages (none: run again after an error). */
@@ -891,8 +961,9 @@ class SessionRunner {
       }
       manager.log.error(`Session ${this.id}: ${error.stack || error.message}`);
       const isAuth = error instanceof AuthError;
-      // The project's spending limit: the card links to the project page, where the limit is raised.
-      const limitProject = error instanceof SpendingLimitError ? projectFolderOf(session.meta) : undefined;
+      // At a limit of the project or a scheduled task, the card links to the project page, where it is raised.
+      // The limit in Settings has no project, so its card has no link: its message says to raise it in Settings.
+      const limitProject = error instanceof SpendingLimitError ? error.project : undefined;
       manager.appendEvent(session, { kind: 'error', text: error.message, auth: isAuth, retryable: !isAuth, limitProject });
       if (isAuth) manager.hub.broadcast({ type: 'auth', auth: manager.auth.status() });
     }
@@ -953,6 +1024,10 @@ class SessionRunner {
       const { servers, skipped } = await manager.mcpServersFor(session);
       const mcp = Object.keys(servers).length > 0 ? await manager.mcp.toolsFor({ servers, cwd: session.meta.cwd, extraPath }) : { tools: [], errors: [] };
       for (const problem of [...skipped, ...mcp.errors]) manager.appendEvent(session, { kind: 'notice', text: `MCP: ${problem}` });
+      // PowerShell chosen, but commands run in cmd.exe: Constrained Language Mode (see effectiveShell). The system prompt says so too.
+      if ((await effectiveShell(settings.shell)) !== settings.shell) {
+        manager.appendEvent(session, { kind: 'notice', text: 'PowerShell runs in Constrained Language Mode on this PC (a company policy), so the agent\'s commands run in cmd.exe.' });
+      }
       session.data.toolNames = [...builtIn, ...mcp.tools.map((tool) => tool.name)];
       session.data.toolSpecs = [...toolSpecsFor(builtIn), ...mcp.tools.map(({ name, description, inputSchema }) => ({ name, description, inputSchema }))];
       session.data.mcpTools = Object.fromEntries(mcp.tools.map((tool) => [tool.name, { server: tool.server, tool: tool.tool, readOnly: tool.readOnly }]));
@@ -1012,7 +1087,9 @@ class SessionRunner {
     // Not the user's words: rewind, compaction's "user's latest messages" and the request's initiator skip it.
     if (input.scheduled) Object.assign(message, { auto: true, scheduled: input.scheduled.name });
     // A reminder or loop in an existing session has a limit per run, counted from here. A typed message ends it.
-    session.data.scheduledRun = input.scheduled?.maxCredits ? { id: input.scheduled.id, name: input.scheduled.name, maxCredits: input.scheduled.maxCredits, fromNanoAiu: session.meta.usage.nanoAiu || 0 } : null;
+    session.data.scheduledRun = input.scheduled?.maxCredits
+      ? { id: input.scheduled.id, name: input.scheduled.name, maxCredits: input.scheduled.maxCredits, fromNanoAiu: session.meta.usage.nanoAiu || 0, fromUnpriced: session.meta.usage.unpricedRequests || 0 }
+      : null;
     this.manager.appendMessage(session, message);
     return message;
   }
@@ -1214,6 +1291,7 @@ class SessionRunner {
         },
         onWait: (info) => this.setStatus('retrying', info),
         onUnfinished: (usage) => manager.recordUsage(session, model, usage, 'chat'),
+        onNotice: (text) => manager.appendEvent(session, { kind: 'notice', text }),
         onBadRequest: async (error) => {
           if (isPromptTooLong(error) && !compactedForLength) {
             compactedForLength = true;
@@ -1343,32 +1421,16 @@ class SessionRunner {
     if (!tool || !session.data.toolNames.includes(toolUse.name)) {
       return { block: errorResult(toolUse, `There is no tool named "${toolUse.name}".`) };
     }
-    if (toolUse.invalidJson !== undefined) {
-      return { block: errorResult(toolUse, 'The tool input was not valid JSON (it may have been cut off). Try again, splitting large content into smaller edits.') };
-    }
-    // MCP servers check their own input, with schemas richer than validateToolInput reads.
-    const problem = tool.kind === 'mcp' ? (toolUse.input && typeof toolUse.input === 'object' && !Array.isArray(toolUse.input) ? null : 'The tool input must be a JSON object.') : validateToolInput(tool, toolUse.input);
-    if (problem) return { block: errorResult(toolUse, problem) };
-
     this.toolRuns.set(toolUse.id, { output: '', startedAt: Date.now(), pendingOutput: '', timer: null });
     this.setStatus('running_tool', { tool: toolUse.name, toolUseId: toolUse.id });
     this.hub.broadcast({ type: 'tool_start', sessionId: this.id, toolUseId: toolUse.id, name: toolUse.name });
     try {
-      if (tool.kind === 'meta') return await runMetaTool(this, session, toolUse, signal, assistant);
-      const ctx = this.toolContext(session, assistant, toolUse, signal);
-      const refusal = refusedBeforePrepare(this.manager, session, tool, toolUse.input);
-      if (refusal) return { block: errorResult(toolUse, refusal, { denied: true }) };
-      const prepared = tool.prepare ? await tool.prepare(toolUse.input, ctx) : null;
-      const decision = await authorize(this, session, tool, toolUse, prepared, signal, ctx);
-      if (!decision.allowed) return { block: errorResult(toolUse, decision.message, { denied: true }), stopTurn: decision.stopTurn };
-      const result = await this.runWithHooks(session, tool, toolUse, ctx, prepared);
-      const withInstructions = ctx.trusted ? await this.withFolderInstructions(session, toolUse, result) : result;
-      return { block: toolResultBlock(toolUse, withInstructions) };
+      const outcome = await this.runToolCall(session, assistant, tool, toolUse, signal, { instructionFolders: session.data.instructionFolders });
+      return outcome;
     } catch (error) {
-      if (signal.aborted || isAbortError(error)) return { block: errorResult(toolUse, 'Stopped by the user.', { interrupted: true }) };
-      if (error instanceof ToolInputError) return { block: errorResult(toolUse, error.message) };
-      this.manager.log.error(`Tool ${toolUse.name} failed.`, error);
-      return { block: errorResult(toolUse, `The tool failed: ${error.message}`) };
+      // runToolCall turns every other failure into the tool's result. It throws only for the user's stop.
+      if (!signal.aborted && !isAbortError(error)) throw error;
+      return { block: errorResult(toolUse, 'Stopped by the user.', { interrupted: true }) };
     } finally {
       this.flushToolOutput(toolUse.id);
       this.toolRuns.delete(toolUse.id);
@@ -1377,14 +1439,49 @@ class SessionRunner {
   }
 
   /**
+   * One checked tool call of the agent or a subagent: check the input, refuse, prepare, ask for approval, run.
+   * - `label` names the subagent in approval questions.
+   * - `instructionFolders`: the subfolders whose instruction files this conversation has (see withFolderInstructions).
+   * - Returns { block, followUp, stopTurn }. Throws only when the user stops the turn: each caller handles that.
+   */
+  async runToolCall(session, assistant, tool, toolUse, signal, { label = null, instructionFolders }) {
+    if (toolUse.invalidJson !== undefined) {
+      return { block: errorResult(toolUse, 'The tool input was not valid JSON (it may have been cut off). Try again, splitting large content into smaller edits.') };
+    }
+    // MCP servers check their own input, with schemas richer than validateToolInput reads.
+    const problem = tool.kind === 'mcp' ? (toolUse.input && typeof toolUse.input === 'object' && !Array.isArray(toolUse.input) ? null : 'The tool input must be a JSON object.') : validateToolInput(tool, toolUse.input);
+    if (problem) return { block: errorResult(toolUse, problem) };
+    try {
+      if (tool.kind === 'meta') {
+        const outcome = await runMetaTool(this, session, toolUse, signal, assistant);
+        return outcome;
+      }
+      const ctx = this.toolContext(session, assistant, toolUse, signal);
+      const refusal = refusedBeforePrepare(this.manager, session, tool, toolUse.input);
+      if (refusal) return { block: errorResult(toolUse, refusal, { denied: true }) };
+      const prepared = tool.prepare ? await tool.prepare(toolUse.input, ctx) : null;
+      const decision = await authorize(this, session, tool, toolUse, prepared, signal, ctx, label);
+      if (!decision.allowed) return { block: errorResult(toolUse, decision.message, { denied: true }), stopTurn: decision.stopTurn };
+      const result = await this.runWithHooks(session, tool, toolUse, ctx, prepared);
+      const withInstructions = ctx.trusted ? await this.withFolderInstructions(session, toolUse, result, instructionFolders) : result;
+      return { block: toolResultBlock(toolUse, withInstructions) };
+    } catch (error) {
+      if (signal.aborted || isAbortError(error)) throw error;
+      if (error instanceof ToolInputError) return { block: errorResult(toolUse, error.message) };
+      this.manager.log.error(`Tool ${toolUse.name} failed.`, error);
+      return { block: errorResult(toolUse, `The tool failed: ${error.message}`) };
+    }
+  }
+
+  /**
    * The first time a file tool works in a subfolder of the project, that folder's instruction files join its
    * result (see folderInstructions), as Claude Code does. Only in trusted folders: the files steer the agent.
+   * - `instructionFolders` lists the folders done before and gets the new ones: the session's list for the
+   *   agent, a list of its own for each subagent.
    */
-  async withFolderInstructions(session, toolUse, result) {
+  async withFolderInstructions(session, toolUse, result, instructionFolders) {
     if (result.isError || !FOLDER_INSTRUCTION_TOOLS.has(toolUse.name) || typeof toolUse.input.path !== 'string') return result;
-    // Sessions from before this list have none yet.
-    session.data.instructionFolders = session.data.instructionFolders || [];
-    const items = await folderInstructions(session.meta.cwd, resolvePath(session.meta.cwd, toolUse.input.path), session.data.instructionFolders);
+    const items = await folderInstructions(session.meta.cwd, resolvePath(session.meta.cwd, toolUse.input.path), instructionFolders);
     if (items.length === 0) return result;
     const blocks = items.map((item) => `<instructions source="${item.source}">\n${item.text}\n</instructions>`).join('\n\n');
     const note = `<system-reminder>\nInstruction files for this part of the project. Follow them for the files in their folder.\n\n${blocks}\n</system-reminder>`;
@@ -1398,7 +1495,7 @@ class SessionRunner {
     const result = await tool.run(toolUse.input, ctx, prepared);
     const hooks = this.manager.projects.get(projectFolderOf(session.meta)).hooks;
     if (tool.kind !== 'edit' || result.isError || hooks.length === 0) return result;
-    const checks = await runEditHooks(hooks, { cwd: session.meta.cwd, file: prepared.absolutePath, shell: ctx.settings.shell, extraPath: ctx.extraPath, tmpDir: ctx.tmpDir, signal: ctx.signal });
+    const checks = await runEditHooks(hooks, { cwd: session.meta.cwd, file: prepared.absolutePath, shell: await effectiveShell(ctx.settings.shell), extraPath: ctx.extraPath, tmpDir: ctx.tmpDir, signal: ctx.signal });
     if (checks.length === 0) return result;
     const report = checks.map((check) => `Hook \`${check.command}\` (exit code ${check.exitCode ?? 'none'}${check.timedOut ? ', timed out' : ''}):\n${check.output || '(no output)'}`).join('\n\n');
     const withHooks = { ...result, content: `${result.content}\n\n${report}`, meta: { ...result.meta, hooks: checks } };
@@ -1432,7 +1529,7 @@ class SessionRunner {
       browserProfile: profileForFolder(projectFolderOf(session.meta)),
       // A site the user allowed once for this call (see authorize) counts as approved for this call only.
       approvedHost: null,
-      hostApproved: (host) => host === ctx.approvedHost || hostApproved(session, host, manager.projects.get(projectFolderOf(session.meta)).allowedSites),
+      hostApproved: (host) => host === ctx.approvedHost || hostApproved(session, host, manager.projects.get(projectFolderOf(session.meta)).allowedSites, manager.config.port),
       sessionId: this.id,
       // grep and glob skip sign-in data and protected files, also when they search a parent folder.
       isHidden: (absolutePath) => Boolean(refusedPath(manager, session, absolutePath, { realFolders })),

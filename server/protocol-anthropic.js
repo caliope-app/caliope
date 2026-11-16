@@ -7,6 +7,7 @@
 //   tokens (beta compact-2026-01-12, which Copilot passes on). The reply then starts with a compaction
 //   block that holds the summary. From then on the history starts at that block (see apiHistory).
 import { summaryText } from './conversation.js';
+import { fieldsNamedIn, namesField } from './copilot.js';
 
 const COMPACTION_BETA = 'compact-2026-01-12';
 // The API's smallest trigger.
@@ -129,16 +130,17 @@ export function anthropicBetas(body) {
 }
 
 /**
- * Decide which optional field to drop after a 400, or null when the error is not about one.
+ * Decide which optional field to drop after a 400 (an ApiError), or null when the error does not name one.
  * - Copilot's model metadata is not always accurate, so the app learns from the server's answer.
+ * - Only the field the error names counts (see fieldsNamedIn), plus Copilot's code for an effort it refuses.
  */
-export function adaptationFor400(message, adaptations) {
-  const text = String(message).toLowerCase();
-  if (!adaptations.noCompaction && (text.includes('context_management') || text.includes('compact'))) return 'noCompaction';
-  if (!adaptations.noDisplay && text.includes('display')) return 'noDisplay';
-  if (!adaptations.noEffort && (text.includes('effort') || text.includes('output_config'))) return 'noEffort';
-  if (!adaptations.noCacheControl && text.includes('cache_control')) return 'noCacheControl';
-  if (!adaptations.noThinking && text.includes('thinking') && !text.includes('signature')) return 'noThinking';
+export function adaptationFor400(error, adaptations) {
+  if (!adaptations.noCompaction && namesField(error, 'context_management')) return 'noCompaction';
+  if (!adaptations.noDisplay && namesField(error, 'thinking.display')) return 'noDisplay';
+  if (!adaptations.noEffort && (namesField(error, 'output_config') || namesField(error, 'output_config.effort') || error.code === 'invalid_reasoning_effort')) return 'noEffort';
+  // The cache breakpoints sit inside the system prompt and the last message ("system.0.cache_control").
+  if (!adaptations.noCacheControl && fieldsNamedIn(error).some((name) => name.split('.').includes('cache_control'))) return 'noCacheControl';
+  if (!adaptations.noThinking && namesField(error, 'thinking')) return 'noThinking';
   return null;
 }
 

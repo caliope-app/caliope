@@ -1,9 +1,28 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { toAnthropicMessages, buildAnthropicRequest, adaptationFor400, AnthropicStreamAccumulator, anthropicBetas } from '../server/protocol-anthropic.js';
-import { toOpenAiMessages, buildOpenAiRequest, OpenAiStreamAccumulator } from '../server/protocol-openai.js';
-import { toResponsesInput, buildResponsesRequest, ResponsesStreamAccumulator } from '../server/protocol-responses.js';
+import { toOpenAiMessages, buildOpenAiRequest, openAiAdaptationFor400, OpenAiStreamAccumulator } from '../server/protocol-openai.js';
+import { toResponsesInput, buildResponsesRequest, responsesAdaptationFor400, ResponsesStreamAccumulator } from '../server/protocol-responses.js';
 import { apiHistory, initiatorFor, recoverTodosAndPlan, renderTranscript, isPromptTooLong } from '../server/conversation.js';
+import { CopilotClient, toApiError } from '../server/copilot.js';
+import { streamModelRequest } from '../server/turn-helpers.js';
+
+/** A 400 from Copilot with this JSON body, as the client throws it. */
+function refusal(body) {
+  const error = toApiError(new Response(JSON.stringify(body), { status: 400 }), 'Copilot request failed');
+  return error;
+}
+
+/** A streamed response with these events, as Copilot sends it. */
+function sseResponse(events, { done = true } = {}) {
+  const lines = events.map((event) => `data: ${JSON.stringify(event)}\n\n`);
+  if (done) lines.push('data: [DONE]\n\n');
+  const response = new Response(lines.join(''));
+  return response;
+}
 
 test('a prompt that is too long is recognized in the wordings of Anthropic, OpenAI and Copilot', () => {
   for (const message of ['input length and `max_tokens` exceed context limit: 190000 + 64000 > 200000', 'prompt is too long: 210000 tokens > 200000 maximum', 'This model\'s maximum context length is 272000 tokens', 'prompt token count of 280000 exceeds the limit of 272000']) {
@@ -54,9 +73,102 @@ test('buildAnthropicRequest sets effort, adaptive thinking and cache breakpoints
   assert.deepEqual(adapted.thinking, { type: 'adaptive' });
   assert.equal(adapted.output_config, undefined, 'unsupported effort is left out');
   assert.equal(adapted.system[0].cache_control, undefined);
-  assert.equal(adaptationFor400('thinking.display: Extra inputs are not permitted', {}), 'noDisplay');
-  assert.equal(adaptationFor400('invalid_reasoning_effort', {}), 'noEffort');
-  assert.equal(adaptationFor400('messages.1.content.0: invalid signature in thinking block', {}), null);
+});
+
+test('a 400 turns off only the optional field it names', async () => {
+  const anthropic = async (message) => adaptationFor400(await refusal({ type: 'error', error: { type: 'invalid_request_error', message } }), {});
+  assert.equal(await anthropic('thinking.display: Extra inputs are not permitted'), 'noDisplay');
+  assert.equal(await anthropic('system.0.cache_control: Extra inputs are not permitted'), 'noCacheControl');
+  assert.equal(await anthropic('context_management: Extra inputs are not permitted'), 'noCompaction');
+  assert.equal(adaptationFor400(await refusal({ error: { message: 'Reasoning effort xhigh is not supported for this model.', code: 'invalid_reasoning_effort' } }), {}), 'noEffort');
+  // Errors about something else, though their text has "thinking", "display" or "summary" in it.
+  assert.equal(await anthropic('messages.1.content.0: Invalid `signature` in `thinking` block'), null);
+  assert.equal(await anthropic('messages.2.content.0.type: Expected `thinking` or `redacted_thinking`, but found `text`.'), null);
+  assert.equal(await anthropic('max_tokens: must be below 64000 when thinking is on, to display a summary'), null);
+  assert.equal(await anthropic('Each tool result must include a `tool_use_id`.'), null);
+  // A bare field name, a field in a plain sentence, and the upstream error passed on as JSON text.
+  assert.equal(await anthropic('This model does not support `effort`.'), 'noEffort');
+  assert.equal(await anthropic('adaptive thinking is not supported on this model'), 'noThinking');
+  const upstream = JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: 'thinking.display: Extra inputs are not permitted' } });
+  assert.equal(adaptationFor400(await refusal({ error: { message: upstream } }), {}), 'noDisplay');
+
+  const responses = async (error) => responsesAdaptationFor400(await refusal({ error }), {});
+  assert.equal(await responses({ message: "Invalid value: 'reasoning.encrypted_content'.", param: 'include[0]', code: 'invalid_value' }), 'noEncrypted', 'a path with an index');
+  assert.equal(await responses({ message: "Unsupported parameter: 'reasoning.summary' is not supported with this model.", param: 'reasoning.summary', code: 'unsupported_parameter' }), 'noSummary');
+  assert.equal(await responses({ message: 'Encrypted content is not supported with this model.', param: 'include' }), 'noEncrypted');
+  assert.equal(await responses({ message: "Unknown parameter: 'context_management'." }), 'noCompaction');
+  assert.equal(await responses({ message: 'Each function_call_output must include a call_id.', param: 'input' }), null, 'encrypted reasoning stays on');
+  assert.equal(await responses({ message: 'Invalid request: a tool result must include an id and a summary.' }), null);
+  assert.equal(await responses({ message: 'The encrypted content could not be decrypted.', code: 'invalid_encrypted_content' }), null);
+
+  const chat = async (error) => openAiAdaptationFor400(await refusal({ error }), {});
+  assert.equal(await chat({ message: "Unrecognized request argument supplied: 'stream_options'" }), 'noStreamOptions');
+  assert.equal(await chat({ message: 'This model does not support it.', param: 'reasoning_effort' }), 'noEffort');
+  assert.equal(await chat({ message: 'The effort you asked for must include a plan.' }), null);
+});
+
+test('a refused field is left out with a notice, and a restart remembers it; a refused value only lasts this run', async () => {
+  const cacheFile = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'caliope-adaptations-')), 'models.json');
+  const sol = { id: 'gpt-6-sol', name: 'GPT-6 Sol', protocol: 'responses', efforts: ['xhigh'] };
+  const request = { request: { model: sol, system: 'S', tools: [], history: [{ role: 'user', content: [{ type: 'text', text: 'Hi' }] }], effort: 'xhigh', maxTokens: 1000 } };
+  const bodies = [];
+  const client = new CopilotClient({ auth: null, log: null, cacheFile });
+  client.post = async (pathname, body) => {
+    bodies.push(body);
+    if (body.reasoning?.summary) throw await refusal({ error: { message: "Unsupported parameter: 'reasoning.summary'", param: 'reasoning.summary' } });
+    if (body.reasoning?.effort) throw await refusal({ error: { message: 'Reasoning effort xhigh is not supported for this model.', code: 'invalid_reasoning_effort' } });
+    return sseResponse([{ type: 'response.completed', response: { usage: { input_tokens: 5, output_tokens: 1 } } }]);
+  };
+  const notices = [];
+  await streamModelRequest({ client, model: sol, adaptations: client.adaptationsFor(sol.id), makeRequest: () => request, onNotice: (text) => notices.push(text) });
+  assert.equal(bodies.length, 3);
+  assert.equal(bodies[1].reasoning.summary, undefined, 'the retry leaves the field out');
+  assert.deepEqual(bodies[1].include, ['reasoning.encrypted_content'], 'the rest stays');
+  assert.deepEqual(notices, [
+    'Copilot refused reasoning summaries for GPT-6 Sol. It stays off for this model until Caliope updates or the model list is refreshed in Settings.',
+    'Copilot refused the reasoning settings for GPT-6 Sol. It stays off for this model until Caliope restarts or the model list is refreshed in Settings.',
+  ]);
+  assert.deepEqual(client.adaptationsFor(sol.id), { noSummary: true, noReasoning: true });
+
+  const restarted = new CopilotClient({ auth: null, log: null, cacheFile });
+  await restarted.loadCachedModels();
+  assert.deepEqual(restarted.adaptationsFor(sol.id), { noSummary: true }, 'the refused effort level is not saved');
+  // Two refusals close together both reach the file. A refresh of the model list forgets them all.
+  await Promise.all([restarted.saveAdaptation('claude-opus-5.5', 'noDisplay'), restarted.saveAdaptation('gpt-4.1', 'noStreamOptions')]);
+  const again = new CopilotClient({ auth: null, log: null, cacheFile });
+  await again.loadCachedModels();
+  assert.deepEqual([again.adaptationsFor(sol.id), again.adaptationsFor('claude-opus-5.5'), again.adaptationsFor('gpt-4.1')], [{ noSummary: true }, { noDisplay: true }, { noStreamOptions: true }]);
+  await again.clearAdaptations();
+  assert.deepEqual(again.adaptationsFor(sol.id), {});
+  const refreshed = new CopilotClient({ auth: null, log: null, cacheFile });
+  await refreshed.loadCachedModels();
+  assert.deepEqual(refreshed.adaptationsFor(sol.id), {});
+  // Saved by another version: a new version tries the field again.
+  const adaptationsFile = path.join(path.dirname(cacheFile), 'model-adaptations.json');
+  fs.writeFileSync(adaptationsFile, JSON.stringify({ version: '0.0.1', models: { [sol.id]: { noSummary: true } } }));
+  const updated = new CopilotClient({ auth: null, log: null, cacheFile });
+  await updated.loadCachedModels();
+  assert.deepEqual(updated.adaptationsFor(sol.id), {});
+});
+
+test('a stream that ends early still counts as a request, without tokens or cost when its usage never came', async () => {
+  const gpt = { id: 'gpt-4.1', name: 'GPT-4.1', protocol: 'chat', efforts: [] };
+  const request = { request: { model: gpt, system: 'S', tools: [], history: [{ role: 'user', content: [{ type: 'text', text: 'Hi' }] }], maxTokens: 1000 } };
+  const streams = [
+    sseResponse([{ choices: [{ index: 0, delta: { content: 'Half an ans' } }] }], { done: false }),
+    sseResponse([{ choices: [{ index: 0, delta: { content: 'Answer' }, finish_reason: 'stop' }] }, { choices: [], usage: { prompt_tokens: 50, completion_tokens: 2 }, copilot_usage: { total_nano_aiu: 7 } }]),
+  ];
+  const unfinished = [];
+  const client = { post: async () => streams.shift() };
+  const result = await streamModelRequest({ client, model: gpt, adaptations: {}, makeRequest: () => request, onUnfinished: (usage) => unfinished.push(usage) });
+  assert.deepEqual(unfinished, [{ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, nanoAiu: null, cut: true }], 'the cut attempt counts once, marked as cut');
+  assert.equal(result.usage.nanoAiu, 7, 'the retry counts itself');
+
+  // A failure after the start keeps what Copilot counted for it.
+  const sol = { id: 'gpt-6-sol', name: 'GPT-6 Sol', protocol: 'responses', efforts: [] };
+  const failing = { post: async () => sseResponse([{ type: 'response.failed', response: { error: { code: 'invalid_prompt', message: 'Refused.' }, usage: { input_tokens: 40, output_tokens: 3 } } }]) };
+  await assert.rejects(streamModelRequest({ client: failing, model: sol, adaptations: {}, makeRequest: () => ({ request: { ...request.request, model: sol } }), onUnfinished: (usage) => unfinished.push(usage) }), /Refused/);
+  assert.deepEqual(unfinished[1], { input: 40, output: 3, cacheRead: 0, cacheWrite: 0, nanoAiu: null, cut: true });
 });
 
 test('AnthropicStreamAccumulator assembles thinking, text and tool input; ignores the [DONE] terminator', () => {
@@ -217,7 +329,6 @@ test('compaction blocks go to each format in a form it can use', () => {
   const noCompaction = buildAnthropicRequest({ model, system: 'S', tools, history: history.slice(0, 1), maxTokens: 1000, thinkingDisplay: 'summarized', adaptations: { noCompaction: true }, compactAt: 150000 });
   assert.equal(noCompaction.context_management, undefined);
   assert.deepEqual(anthropicBetas(noCompaction), []);
-  assert.equal(adaptationFor400('context_management: Extra inputs are not permitted', {}), 'noCompaction');
 
   const solInput = toResponsesInput(apiHistory(compacted, 'gpt-6-sol'), 'gpt-6-sol');
   assert.deepEqual(solInput[0], { type: 'compaction', encrypted_content: 'cmp_gpt-6-sol_0', id: 'cmp_1' });

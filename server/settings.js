@@ -1,5 +1,5 @@
 import fsp from 'node:fs/promises';
-import { readJson, writeJsonAtomic, isPlainObject } from './util.js';
+import { readJson, writeJsonAtomic, isPlainObject, KeyedQueue } from './util.js';
 import { detectExtraPath, bundledRuntime } from './config.js';
 import { DEFAULT_PROTECTED_FILES } from './protected-files.js';
 import { validateMcpServers } from './mcp.js';
@@ -15,8 +15,9 @@ export const DEFAULT_SETTINGS = {
   buildModel: null,
   buildEffort: 'medium',
   titleModel: null,
-  // Permissions and modes. Auto, as developers use Claude Code: edits apply and a safety check judges commands.
-  defaultMode: 'auto',
+  // Permissions and modes. Accept edits for a new install: file edits in the project apply, commands ask.
+  // Settings saved before keep their mode.
+  defaultMode: 'edits',
   allowedCommands: [],
   // Files the agent may not open: secrets such as .env files and private keys (see protected-files.js).
   protectedFiles: DEFAULT_PROTECTED_FILES,
@@ -50,6 +51,8 @@ export const DEFAULT_SETTINGS = {
   noProxy: '',
   // US dollars say more than AI credits (1 credit is $0.01).
   costUnit: 'usd',
+  // AI credits all of Caliope may spend per calendar month, 0 for no limit. Each project can have its own limit too.
+  creditLimit: 0,
   // Interface. Browser: where the app window and clicked links open, and which browser the agent drives.
   browser: 'chrome',
   theme: 'system',
@@ -58,6 +61,8 @@ export const DEFAULT_SETTINGS = {
   checkUpdates: true,
   // Install a newer release found that way without asking. Off: a release only installs when the user clicks Update.
   autoUpdate: false,
+  // Start at sign-in without a window and keep running without one, so scheduled tasks run on time (see main.js).
+  keepRunning: false,
   recentFolders: [],
 };
 
@@ -90,11 +95,13 @@ const VALIDATORS = {
   proxy: proxyAddress,
   noProxy: stringMax(2000),
   costUnit: oneOf(['credits', 'usd']),
+  creditLimit: integerBetween(0, 1000000),
   browser: oneOf(['chrome', 'edge', 'system']),
   theme: oneOf(['system', 'light', 'dark']),
   notifications: boolean,
   checkUpdates: boolean,
   autoUpdate: boolean,
+  keepRunning: boolean,
   recentFolders: stringList(20),
 };
 
@@ -104,18 +111,25 @@ export class SettingsStore {
     this.log = log;
     this.values = { ...DEFAULT_SETTINGS };
     this.listeners = new Set();
+    // Saves run one after another, so the file always ends with the latest values.
+    this.queue = new KeyedQueue();
+    // True when Caliope started without settings.json, until a default mode is saved: the window then asks the
+    // user to choose one. Any saved setting creates the file (a remembered folder too), so after a restart the
+    // window no longer asks, also when the user never answered.
+    this.firstRun = false;
   }
 
   async load() {
     let stored;
     try {
-      stored = await readJson(this.file, {});
+      stored = await readJson(this.file, null);
     } catch (error) {
       // A damaged settings file should not stop the app. Keep a copy and start from defaults.
       this.log?.warn('Settings file could not be read; using defaults.', error);
       await fsp.copyFile(this.file, `${this.file}.damaged`).catch(() => {});
       stored = {};
     }
+    this.firstRun = stored === null;
     const values = { ...DEFAULT_SETTINGS };
     for (const [key, value] of Object.entries(isPlainObject(stored) ? stored : {})) {
       if (!(key in VALIDATORS)) continue;
@@ -153,7 +167,8 @@ export class SettingsStore {
       next[key] = result.value;
     }
     this.values = next;
-    await writeJsonAtomic(this.file, this.values);
+    if ('defaultMode' in patch) this.firstRun = false;
+    await this.queue.run(this.file, () => writeJsonAtomic(this.file, this.values));
     for (const listener of this.listeners) listener(this.get());
     return this.get();
   }

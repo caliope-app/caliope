@@ -30,6 +30,39 @@ export function clear(element) {
   return element;
 }
 
+/**
+ * Keep what is typed in a text field in `drafts[key]`, so a redraw of the page puts it back.
+ * - `saved`: what the field shows while it has no draft.
+ * - The page deletes `drafts[key]` once the text is saved (or added), so the field shows what is saved again.
+ * - Returns the field.
+ */
+export function keepDraft(input, drafts, key, saved = '') {
+  input.value = drafts[key] ?? saved;
+  input.addEventListener('input', () => {
+    drafts[key] = input.value;
+  });
+  return input;
+}
+
+/**
+ * Redraw a page with `draw`, but not while a field in `page` has the focus.
+ * - A redraw would replace the field the user types in. Leaving the new field fires no change event, so a field that
+ *   saves on change would not save.
+ * - Returns the function to redraw with. While a field has the focus, the redraw waits until the focus leaves `page`.
+ *   When the window loses the focus, the field keeps it, so the redraw waits for the next time it leaves.
+ */
+export function redrawAfterEditing(page, draw) {
+  let due = false;
+  const redraw = () => {
+    due = page.contains(document.activeElement) && document.activeElement.matches('input, select, textarea');
+    if (!due) draw();
+  };
+  page.addEventListener('focusout', (event) => {
+    if (due && !page.contains(event.relatedTarget)) redraw();
+  });
+  return redraw;
+}
+
 const ESCAPES = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
 
 export function escapeHtml(text) {
@@ -57,7 +90,7 @@ export function relativeTime(iso) {
   if (hours < 24) return `${hours} h ago`;
   const days = Math.round(hours / 24);
   if (days < 7) return `${days} d ago`;
-  return new Date(iso).toLocaleDateString(undefined, { day: 'numeric', month: 'short', year: days > 300 ? 'numeric' : undefined });
+  return new Date(iso).toLocaleDateString('en-US', { day: 'numeric', month: 'short', year: days > 300 ? 'numeric' : undefined });
 }
 
 export function formatTokens(count) {
@@ -70,9 +103,10 @@ export function formatTokens(count) {
 export const NANO_PER_CREDIT = 1e9;
 
 /**
- * Format a cost given in nano-AIU.
+ * Format a cost given in nano-AIU, in US English with fixed precision: dollars with 2 decimals, credits with 1.
  * - `unit` is 'credits' or 'usd' (1 AI credit = US$0.01).
  * - `unpriced` > 0 means some requests had no price, so the cost is shown as a minimum (≥).
+ * - A cost too small for that precision shows as "< $0.01" or "< 0.1 cr".
  * - Returns '—' when the cost is unknown.
  */
 export function formatCost(nanoAiu, unit = 'usd', { unpriced = 0 } = {}) {
@@ -81,16 +115,19 @@ export function formatCost(nanoAiu, unit = 'usd', { unpriced = 0 } = {}) {
   const approximate = unpriced > 0 ? '≥ ' : '';
   if (unit === 'usd') {
     const dollars = credits / 100;
-    return `${approximate}$${dollars < 0.01 && dollars > 0 ? dollars.toFixed(4) : dollars.toFixed(2)}`;
+    if (dollars > 0 && dollars < 0.01 && !approximate) return '< $0.01';
+    const dollarText = `${approximate}$${dollars.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+    return dollarText;
   }
-  const digits = credits >= 100 ? 0 : credits >= 10 ? 1 : 2;
-  return `${approximate}${credits.toLocaleString(undefined, { minimumFractionDigits: digits, maximumFractionDigits: digits })} cr`;
+  if (credits > 0 && credits < 0.1 && !approximate) return '< 0.1 cr';
+  const creditText = `${approximate}${credits.toLocaleString('en-US', { minimumFractionDigits: 1, maximumFractionDigits: 1 })} cr`;
+  return creditText;
 }
 
 export function formatCredits(credits, unit = 'usd') {
   if (credits === null || credits === undefined) return '—';
-  if (unit === 'usd') return `$${(credits / 100).toFixed(2)}`;
-  return `${Number(credits).toLocaleString(undefined, { maximumFractionDigits: 1 })} cr`;
+  if (unit === 'usd') return `$${(credits / 100).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+  return `${Number(credits).toLocaleString('en-US', { maximumFractionDigits: 1 })} cr`;
 }
 
 /**

@@ -1,7 +1,7 @@
 // Things the user can do, and how server events update the state.
 import { api, withKey } from './api.js';
 import { state, emit, runtimeOf, savePreference } from './store.js';
-import { h, basename, formatCost } from './dom.js';
+import { h, basename, formatCost, pluralize } from './dom.js';
 import { confirmDialog, promptDialog, openModal, toast, toastError } from '../views/dialogs.js';
 
 // ---------- Updates ----------
@@ -19,11 +19,12 @@ export async function checkForUpdate() {
 
 export async function installUpdate() {
   const latest = state.update?.latest;
-  const ok = await confirmDialog({ title: `Update Caliope to ${latest}?`, message: 'The update downloads in a PowerShell window. Then the new version starts and this one closes. A turn that is still running stops.', confirmLabel: 'Update' });
+  const ok = await confirmDialog({ title: `Update Caliope to ${latest}?`, message: 'Caliope downloads and checks the new version. Once no turn or background command runs, the new version starts and this window closes.', confirmLabel: 'Update' });
   if (!ok) return;
   try {
+    toast(`Downloading Caliope ${latest}…`);
     await api.post('/api/update/install');
-    toast('Downloading the update in a PowerShell window.');
+    toast(`Caliope ${latest} is installed. It starts once no turn or background command runs.`);
   } catch (error) {
     toastError(error);
   }
@@ -114,27 +115,29 @@ export function markSeen(id) {
 
 /**
  * Start a session. The first session in a folder asks whether to trust it. The answer is remembered for the folder.
+ * - `model` and `effort` are the new-session page's picks; without them the session gets the defaults from Settings.
  */
-export async function createSession({ cwd, mode, worktree = false }) {
+export async function createSession({ cwd, mode, worktree = false, model = null, effort = null }) {
   let payload;
   try {
-    payload = await api.post('/api/sessions', { cwd, mode, worktree });
+    payload = await api.post('/api/sessions', { cwd, mode, worktree, model, effort });
   } catch (error) {
     if (error.status !== 428) throw error;
+    // The dialog itself takes the focus, so the Enter that sent the message cannot answer it.
     const trust = await new Promise((resolve) => {
       openModal({
         title: 'Do you trust this folder?',
-        body: h('div', { class: 'stack' }, h('p', { style: { margin: 0 } }, error.message), h('p', { class: 'muted', style: { margin: 0, fontSize: '13px' } }, 'MCP servers and skills can run programs on your PC. Without trust, sessions here work without them. You can change this on the project page.')),
+        body: h('div', { class: 'stack' }, h('div', { class: 'mono', style: { fontSize: '12.5px', wordBreak: 'break-all' } }, cwd), h('p', { style: { margin: 0 } }, error.message), h('p', { class: 'muted', style: { margin: 0, fontSize: '13px' } }, 'MCP servers and skills can run programs on your PC. Without trust, sessions here work without them. You can change this on the project page.')),
         footer: (close) => [
           h('button', { class: 'btn', type: 'button', onClick: () => close(false) }, 'Don\'t trust'),
-          h('button', { class: 'btn primary', type: 'button', autofocus: true, onClick: () => close(true) }, 'Trust this folder'),
+          h('button', { class: 'btn primary', type: 'button', onClick: () => close(true) }, 'Trust this folder'),
         ],
         onClose: (value) => resolve(typeof value === 'boolean' ? value : null),
       });
     });
     // Closing the dialog cancels the new session without deciding.
     if (trust === null) throw new Error('The session was not started.');
-    payload = await api.post('/api/sessions', { cwd, mode, worktree, trust });
+    payload = await api.post('/api/sessions', { cwd, mode, worktree, model, effort, trust });
   }
   state.sessions.set(payload.meta.id, payload.meta);
   savePreference('lastSession', payload.meta.id);
@@ -334,7 +337,7 @@ export async function rewindTo(messageId) {
     ? h(
         'div',
         { class: 'stack' },
-        h('label', { class: 'row' }, restoreBox, h('span', {}, `Also restore ${preview.files.length} file${preview.files.length === 1 ? '' : 's'} the agent changed after this message`)),
+        h('label', { class: 'row' }, restoreBox, h('span', {}, `Also restore ${pluralize(preview.files.length, 'file')} the agent changed after this message`)),
         h(
           'ul',
           { class: 'muted', style: { margin: '0', paddingLeft: '20px', fontSize: '12.5px', maxHeight: '180px', overflowY: 'auto' } },
@@ -342,7 +345,7 @@ export async function rewindTo(messageId) {
             h('li', { class: file.conflict ? 'warning-text' : '' }, `${file.action === 'delete' ? 'Delete' : 'Restore'} ${file.shownPath}${file.conflict ? ' (changed since, skipped unless you overwrite)' : ''}`),
           ),
         ),
-        conflicts.length ? h('label', { class: 'row warning-text' }, forceBox, h('span', {}, `Overwrite the ${conflicts.length} file(s) changed since`)) : null,
+        conflicts.length ? h('label', { class: 'row warning-text' }, forceBox, h('span', {}, `Overwrite the ${pluralize(conflicts.length, 'file')} changed since`)) : null,
       )
     : h('p', { class: 'muted', style: { margin: '0' } }, 'No files were changed by the agent after this message.');
   const ok = await confirmDialog({
@@ -357,8 +360,8 @@ export async function rewindTo(messageId) {
     await reloadActive();
     emit('composer:restore', { text: result.prompt.text, images: result.prompt.images });
     const parts = [];
-    if (result.restored.length) parts.push(`restored ${result.restored.length} file(s)`);
-    if (result.skipped.length) parts.push(`skipped ${result.skipped.length} changed file(s)`);
+    if (result.restored.length) parts.push(`restored ${pluralize(result.restored.length, 'file')}`);
+    if (result.skipped.length) parts.push(`skipped ${pluralize(result.skipped.length, 'changed file')}`);
     toast(`Rewound${parts.length ? `: ${parts.join(', ')}` : ''}.`);
   } catch (error) {
     toastError(error);

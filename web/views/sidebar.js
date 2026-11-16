@@ -1,10 +1,10 @@
 // Sidebar: new session, search, session history (by date or project), budget and account.
-import { h, clear, basename, relativeTime, formatCost, formatCredits, debounce, onNextFrame, projectFolder } from '../lib/dom.js';
+import { h, clear, basename, relativeTime, formatCost, formatCredits, debounce, onNextFrame, projectFolder, pluralize } from '../lib/dom.js';
 import { icon } from '../lib/icons.js';
 import { api } from '../lib/api.js';
 import { state, on, emit, runtimeOf, savePreference, loadPreference } from '../lib/store.js';
 import * as actions from '../lib/actions.js';
-import { openMenu, openModal, toastError } from './dialogs.js';
+import { openMenu, openModal, openFolderBrowser, toastError } from './dialogs.js';
 
 export function mountSidebar(container) {
   let searchResults = [];
@@ -13,9 +13,11 @@ export function mountSidebar(container) {
 
   const searchInput = h('input', { class: 'input', type: 'search', placeholder: 'Search sessions', 'aria-label': 'Search sessions' });
   searchInput.value = state.sidebar.query;
-  const listElement = h('nav', { class: 'session-list' });
+  const listElement = h('nav', { class: 'session-list', 'aria-label': 'Session list' });
   const tabsElement = h('div', { class: 'list-tabs' });
   const budgetElement = h('div');
+  // The update button gets a row of its own, so it never crowds the sign-in button.
+  const updateElement = h('div');
   const accountElement = h('div', { class: 'account-row' });
 
   const top = h(
@@ -27,7 +29,7 @@ export function mountSidebar(container) {
   );
   const searchBox = h('div', { class: 'search-box' }, h('span', { html: icon('search', 14) }), searchInput);
   const pullsButton = h('button', { class: 'btn ghost small nav-item', type: 'button', onClick: () => actions.showView('pulls') }, h('span', { html: icon('git-pull-request', 15) }), 'Pull requests');
-  const full = h('div', { class: 'sidebar-full' }, top, h('div', { class: 'sidebar-actions' }, searchBox, pullsButton), tabsElement, listElement, h('div', { class: 'sidebar-bottom' }, budgetElement, accountElement));
+  const full = h('div', { class: 'sidebar-full' }, top, h('div', { class: 'sidebar-actions' }, searchBox, pullsButton), tabsElement, listElement, h('div', { class: 'sidebar-bottom' }, budgetElement, updateElement, accountElement));
   // Collapsed, the sidebar stays as a narrow rail of icons, so it can always be brought back.
   const waitingBadge = h('span', { class: 'rail-badge', hidden: true });
   const expandButton = railButton('panel-left', 'Show sidebar (Ctrl+B)', () => emit('sidebar:toggle'), waitingBadge);
@@ -101,15 +103,34 @@ export function mountSidebar(container) {
       const first = listElement.querySelector('.session-item');
       first?.click();
     }
+    if (event.key === 'ArrowDown') {
+      event.preventDefault();
+      listElement.querySelector('.session-item, .project-group')?.focus();
+    }
+  });
+
+  // The arrow keys move between the sessions and project headers in the list.
+  listElement.addEventListener('keydown', (event) => {
+    if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp') return;
+    const items = [...listElement.querySelectorAll('.session-item, .project-group')];
+    const index = items.indexOf(document.activeElement);
+    if (index < 0) return;
+    event.preventDefault();
+    const next = index + (event.key === 'ArrowDown' ? 1 : -1);
+    if (next < 0) searchInput.focus();
+    else items[Math.min(next, items.length - 1)].focus();
   });
 
   function scheduleRender() {
     if (frame) return;
     frame = onNextFrame(() => {
       frame = null;
+      // The keyboard focus stays on the same session or project when the list is redrawn.
+      const focusedKey = listElement.contains(document.activeElement) ? document.activeElement.closest('[data-key]')?.dataset.key : null;
       renderTabs();
       renderList();
       renderRail();
+      if (focusedKey) listElement.querySelector(`[data-key="${CSS.escape(focusedKey)}"]`)?.focus();
     });
   }
 
@@ -184,14 +205,14 @@ export function mountSidebar(container) {
       const active = state.view === 'project' && state.projectFolder?.toLowerCase() === project.folder.toLowerCase();
       listElement.append(
         h(
-          'div',
-          { class: `session-item${active ? ' active' : ''}`, role: 'button', tabindex: '0', title: project.folder, onClick: () => actions.openProject(project.folder) },
+          'button',
+          { class: `session-item${active ? ' active' : ''}`, type: 'button', title: project.folder, dataset: { key: `project:${project.folder}` }, onClick: () => actions.openProject(project.folder) },
           h('span', { class: 'status', html: icon('folder', 14) }),
           h(
-            'div',
+            'span',
             { class: 'body' },
-            h('div', { class: 'title' }, project.name || basename(project.folder)),
-            h('div', { class: 'sub' }, h('span', {}, `${project.sessions} session${project.sessions === 1 ? '' : 's'}`), project.lastActivity ? h('span', {}, `· ${relativeTime(project.lastActivity)}`) : null, h('span', { class: 'cost' }, formatCost(project.nanoAiu, state.settings?.costUnit))),
+            h('span', { class: 'title' }, project.name || basename(project.folder)),
+            h('span', { class: 'sub' }, h('span', {}, pluralize(project.sessions, 'session')), project.lastActivity ? h('span', {}, `· ${relativeTime(project.lastActivity)}`) : null, h('span', { class: 'cost' }, formatCost(project.nanoAiu, state.settings?.costUnit))),
           ),
         ),
       );
@@ -300,9 +321,11 @@ export function mountSidebar(container) {
         tabindex: '0',
         title: folder,
         'aria-expanded': String(!collapsed),
+        dataset: { key: `group:${folder}` },
         onClick: toggle,
         onKeydown: (event) => {
-          if (event.key === 'Enter' || event.key === ' ') {
+          // Enter on the + or the gear belongs to that button.
+          if (event.target === event.currentTarget && (event.key === 'Enter' || event.key === ' ')) {
             event.preventDefault();
             toggle();
           }
@@ -327,22 +350,26 @@ export function mountSidebar(container) {
     else status = h('span', { class: 'status-dot' });
     const usage = meta.usage || {};
     const cost = usage.requests ? formatCost(usage.nanoAiu, state.settings?.costUnit, { unpriced: usage.unpricedRequests || 0 }) : '';
+    // The same actions from the ... button and from a right-click (or the menu key) on the session.
+    const menuItems = () => [
+      { label: 'Rename', icon: 'square-pen', onSelect: () => actions.renameSession(meta.id) },
+      { label: meta.pinned ? 'Unpin' : 'Pin to top', icon: meta.pinned ? 'pin-off' : 'pin', onSelect: () => actions.togglePin(meta.id) },
+      { label: 'Fork into a new session', icon: 'git-fork', onSelect: () => actions.forkSession(meta.id) },
+      { label: 'Export as Markdown', icon: 'download', onSelect: () => actions.exportSession(meta.id) },
+      { label: 'Open folder in Explorer', icon: 'folder-open', onSelect: () => actions.openPath(meta.cwd) },
+      'separator',
+      { label: meta.archived ? 'Restore from archive' : 'Archive', icon: meta.archived ? 'archive-restore' : 'archive', onSelect: () => actions.toggleArchive(meta.id) },
+      { label: 'Delete', icon: 'trash-2', danger: true, onSelect: () => actions.deleteSession(meta.id) },
+    ];
     const more = h('button', {
       class: 'btn ghost small icon-only',
+      type: 'button',
       title: 'More',
+      'aria-label': `More for ${meta.title}`,
       html: icon('ellipsis', 14),
       onClick: (event) => {
         event.stopPropagation();
-        openMenu(event.currentTarget, [
-          { label: 'Rename', icon: 'square-pen', onSelect: () => actions.renameSession(meta.id) },
-          { label: meta.pinned ? 'Unpin' : 'Pin to top', icon: meta.pinned ? 'pin-off' : 'pin', onSelect: () => actions.togglePin(meta.id) },
-          { label: 'Fork into a new session', icon: 'git-fork', onSelect: () => actions.forkSession(meta.id) },
-          { label: 'Export as Markdown', icon: 'download', onSelect: () => actions.exportSession(meta.id) },
-          { label: 'Open folder in Explorer', icon: 'folder-open', onSelect: () => actions.openPath(meta.cwd) },
-          'separator',
-          { label: meta.archived ? 'Restore from archive' : 'Archive', icon: meta.archived ? 'archive-restore' : 'archive', onSelect: () => actions.toggleArchive(meta.id) },
-          { label: 'Delete', icon: 'trash-2', danger: true, onSelect: () => actions.deleteSession(meta.id) },
-        ]);
+        openMenu(event.currentTarget, menuItems());
       },
     });
     const item = h(
@@ -352,9 +379,18 @@ export function mountSidebar(container) {
         role: 'button',
         tabindex: '0',
         title: `${meta.title}\n${meta.cwd}`,
+        dataset: { key: meta.id },
         onClick: () => actions.openSession(meta.id),
         onKeydown: (event) => {
-          if (event.key === 'Enter') actions.openSession(meta.id);
+          // Enter on the ... button belongs to that button.
+          if (event.target === event.currentTarget && (event.key === 'Enter' || event.key === ' ')) {
+            event.preventDefault();
+            actions.openSession(meta.id);
+          }
+        },
+        onContextmenu: (event) => {
+          event.preventDefault();
+          openMenu(item, menuItems());
         },
       },
       h('span', { class: 'status' }, status),
@@ -363,7 +399,7 @@ export function mountSidebar(container) {
         { class: 'body' },
         h('div', { class: 'title' }, meta.title),
         h('div', { class: 'sub' }, meta.schedule ? h('span', { title: `Scheduled task "${meta.schedule.name}"`, html: icon('history', 12) }) : null, showFolder ? h('span', { class: 'ellipsis' }, basename(projectFolder(meta))) : null, showFolder ? h('span', {}, '·') : null, h('span', {}, relativeTime(meta.updatedAt)), cost ? h('span', { class: 'cost' }, cost) : null),
-        snippet ? h('div', { class: 'search-hit' }, `…${snippet}…`) : null,
+        snippet ? h('div', { class: 'search-hit' }, '…', markMatches(snippet, state.sidebar.query), '…') : null,
       ),
       h('div', { class: 'hover-actions' }, more),
     );
@@ -380,12 +416,12 @@ export function mountSidebar(container) {
       const used = allowance.used ?? Math.max(0, allowance.entitlement - (allowance.remaining ?? 0));
       const percentUsed = Math.min(100, Math.max(0, (used / allowance.entitlement) * 100));
       const credits = allowance.tokenBased !== false;
-      const amount = (value) => (credits ? formatCredits(value, unit) : `${Math.round(value)} requests`);
+      const amount = (value) => (credits ? formatCredits(value, unit) : pluralize(Math.round(value), 'request'));
       const meterClass = percentUsed >= 100 ? 'meter over' : percentUsed >= 80 ? 'meter warn' : 'meter';
       widget.append(
         h('div', { class: 'line' }, h('span', { class: 'muted' }, 'Copilot allowance'), h('span', {}, `${amount(allowance.remaining)} left`)),
         h('div', { class: meterClass }, h('div', { style: { width: `${percentUsed}%` } })),
-        h('div', { class: 'line faint' }, h('span', {}, `${amount(used)} of ${amount(allowance.entitlement)} used`), h('span', {}, allowance.resetDate ? `resets ${new Date(allowance.resetDate).toLocaleDateString(undefined, { day: 'numeric', month: 'short' })}` : '')),
+        h('div', { class: 'line faint' }, h('span', {}, `${amount(used)} of ${amount(allowance.entitlement)} used`), h('span', {}, allowance.resetDate ? `resets ${new Date(allowance.resetDate).toLocaleDateString('en-US', { day: 'numeric', month: 'short' })}` : '')),
       );
     } else if (allowance?.unlimited) {
       widget.append(h('div', { class: 'line' }, h('span', { class: 'muted' }, 'Copilot allowance'), h('span', {}, 'Unlimited')));
@@ -407,19 +443,21 @@ export function mountSidebar(container) {
   }, 1500);
 
   function renderAccount() {
+    clear(updateElement);
     clear(accountElement);
     // A copy unzipped by hand updates by unzipping the new version. The install line would add a second copy.
-    if (state.update?.available && state.update.installed) accountElement.append(h('button', { class: 'btn small primary', title: 'A newer version of Caliope is available', onClick: () => actions.installUpdate() }, h('span', { html: icon('download', 14) }), `Update to ${state.update.latest}`));
-    else if (state.update?.available) accountElement.append(h('a', { class: 'btn small primary', href: state.update.downloadUrl, target: '_blank', rel: 'noopener noreferrer', title: 'Download the new zip and unzip it to a new folder' }, h('span', { html: icon('download', 14) }), `Get ${state.update.latest}`));
+    const updateStyle = { width: '100%' };
+    if (state.update?.available && state.update.installed) updateElement.append(h('button', { class: 'btn small primary', style: updateStyle, title: 'A newer version of Caliope is available', onClick: () => actions.installUpdate() }, h('span', { html: icon('download', 14) }), `Update to ${state.update.latest}`));
+    else if (state.update?.available) updateElement.append(h('a', { class: 'btn small primary', style: updateStyle, href: state.update.downloadUrl, target: '_blank', rel: 'noopener noreferrer', title: 'Download the new zip and unzip it to a new folder' }, h('span', { html: icon('download', 14) }), `Get ${state.update.latest}`));
     const auth = state.auth;
     if (auth?.signedIn) {
-      accountElement.append(h('span', { html: icon('user', 14), class: 'faint' }), h('span', { class: 'ellipsis grow', title: `Signed in with ${auth.kind === 'token' ? 'a personal access token' : 'GitHub'}` }, auth.login || 'Signed in'));
+      accountElement.append(h('button', { class: 'btn ghost small account-name grow', type: 'button', title: `Signed in with ${auth.kind === 'token' ? 'a personal access token' : 'GitHub'}. Click for the account settings.`, onClick: () => actions.showView('settings') }, h('span', { html: icon('user', 14), class: 'faint' }), h('span', { class: 'ellipsis' }, auth.login || 'Signed in')));
     } else {
       accountElement.append(h('button', { class: 'btn small primary grow', onClick: () => actions.showView('signin') }, h('span', { html: icon('key-round', 14) }), 'Sign in to Copilot'));
     }
     accountElement.append(
-      h('button', { class: 'btn ghost small icon-only', title: 'Spending and allowance', html: icon('chart-column', 15), onClick: () => actions.showView('usage') }),
-      h('button', { class: 'btn ghost small icon-only', title: 'Settings', html: icon('settings', 15), onClick: () => actions.showView('settings') }),
+      h('button', { class: 'btn ghost small icon-only', title: 'Spending and allowance', 'aria-label': 'Spending and allowance', html: icon('chart-column', 15), onClick: () => actions.showView('usage') }),
+      h('button', { class: 'btn ghost small icon-only', title: 'Settings (Ctrl+,)', 'aria-label': 'Settings', html: icon('settings', 15), onClick: () => actions.showView('settings') }),
     );
   }
 
@@ -447,14 +485,10 @@ export function mountSidebar(container) {
       class: 'btn',
       type: 'button',
       onClick: async () => {
-        try {
-          const result = await api.post('/api/pick-folder', { initial: folderInput.value || parent });
-          if (result.path) {
-            folderInput.value = result.path;
-            if (!nameInput.value.trim()) nameInput.value = basename(result.path);
-          }
-        } catch (error) {
-          toastError(error);
+        const picked = await openFolderBrowser({ title: 'Choose the project folder', initial: folderInput.value.trim() || parent });
+        if (picked) {
+          folderInput.value = picked;
+          if (!nameInput.value.trim()) nameInput.value = basename(picked);
         }
       },
     }, h('span', { html: icon('folder-open', 14) }), 'Browse…');
@@ -516,4 +550,14 @@ export function mountSidebar(container) {
   renderAccount();
   loadMonthSpend();
   setInterval(scheduleRender, 60000);
+}
+
+/** A search snippet with the searched words marked. */
+function markMatches(snippet, query) {
+  const words = query.trim().split(/\s+/).filter(Boolean).map((word) => word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+  if (words.length === 0) return snippet;
+  const parts = snippet.split(new RegExp(`(${words.join('|')})`, 'gi'));
+  // split() with a group puts the matches at the odd places.
+  const marked = parts.map((part, index) => (index % 2 ? h('mark', {}, part) : part));
+  return marked;
 }

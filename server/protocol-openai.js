@@ -1,5 +1,6 @@
 // OpenAI Chat Completions format (Copilot's /chat/completions), used for non-Claude models.
 import { summaryText, toolResultText } from './conversation.js';
+import { namesField } from './copilot.js';
 
 /**
  * Convert stored session messages into Chat Completions messages.
@@ -69,10 +70,10 @@ export function buildOpenAiRequest({ model, system, tools, history, effort, maxT
   return body;
 }
 
-export function openAiAdaptationFor400(message, adaptations) {
-  const text = String(message).toLowerCase();
-  if (!adaptations.noEffort && (text.includes('reasoning_effort') || text.includes('effort'))) return 'noEffort';
-  if (!adaptations.noStreamOptions && text.includes('stream_options')) return 'noStreamOptions';
+/** The optional field to leave out after a 400 (an ApiError) that names it (see fieldsNamedIn), or null. */
+export function openAiAdaptationFor400(error, adaptations) {
+  if (!adaptations.noEffort && (namesField(error, 'reasoning_effort') || error.code === 'invalid_reasoning_effort')) return 'noEffort';
+  if (!adaptations.noStreamOptions && namesField(error, 'stream_options')) return 'noStreamOptions';
   return null;
 }
 

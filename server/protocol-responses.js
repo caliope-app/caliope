@@ -6,6 +6,7 @@
 //   many tokens and returns an encrypted compaction item. Like reasoning, only the model that wrote it can
 //   read it. The history starts at the latest one (see apiHistory).
 import { summaryText, toolResultText } from './conversation.js';
+import { namesField } from './copilot.js';
 
 /**
  * The stored session messages as Responses input items.
@@ -76,14 +77,13 @@ export function buildResponsesRequest({ model, system, tools, hostedTools = [], 
   return body;
 }
 
-/** The optional field to leave out after a 400 that names it, or null. */
-export function responsesAdaptationFor400(message, adaptations) {
-  const text = String(message).toLowerCase();
-  if (!adaptations.noCompaction && (text.includes('context_management') || text.includes('compaction'))) return 'noCompaction';
-  if (!adaptations.noSummary && text.includes('summary')) return 'noSummary';
-  if (!adaptations.noEncrypted && (text.includes('include') || text.includes('encrypted'))) return 'noEncrypted';
-  if (!adaptations.noMaxTokens && text.includes('max_output_tokens')) return 'noMaxTokens';
-  if (!adaptations.noReasoning && (text.includes('reasoning') || text.includes('effort'))) return 'noReasoning';
+/** The optional field to leave out after a 400 (an ApiError) that names it (see fieldsNamedIn), or null. */
+export function responsesAdaptationFor400(error, adaptations) {
+  if (!adaptations.noCompaction && namesField(error, 'context_management')) return 'noCompaction';
+  if (!adaptations.noSummary && namesField(error, 'reasoning.summary')) return 'noSummary';
+  if (!adaptations.noEncrypted && (namesField(error, 'include') || namesField(error, 'reasoning.encrypted_content'))) return 'noEncrypted';
+  if (!adaptations.noMaxTokens && namesField(error, 'max_output_tokens')) return 'noMaxTokens';
+  if (!adaptations.noReasoning && (namesField(error, 'reasoning') || namesField(error, 'reasoning.effort') || error.code === 'invalid_reasoning_effort')) return 'noReasoning';
   return null;
 }
 
@@ -192,6 +192,9 @@ export class ResponsesStreamAccumulator {
         break;
       }
       case 'response.failed': {
+        // The failed response can still carry what Copilot counted for it (see onUnfinished).
+        this.mergeUsage(payload.response?.usage);
+        this.mergeCopilotUsage(payload.response?.copilot_usage);
         const error = new Error(payload.response?.error?.message || 'The model reported a failure.');
         error.streamErrorType = payload.response?.error?.code === 'server_error' ? 'api_error' : 'error';
         throw error;

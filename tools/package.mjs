@@ -1,9 +1,10 @@
 // Builds the release files in dist/, with the same names for every version:
 //   Caliope-windows-x64.zip  the app with Node.js inside (its files at the root of the zip)
 //   manifest.json            version, Node.js version, size and SHA-256 of the zip, read by install.ps1, the
-//                            update check and .github/workflows/node-security.yml
+//                            update check, the in-app update and .github/workflows/node-security.yml
 //   install.ps1              the one-line installer, with this repository's releases address filled in
-// .github/workflows/release.yml runs this for a v<version> tag and publishes the three files (see README.md).
+// .github/workflows/release.yml runs this for a v<version> tag, adds manifest.json.sig (the signature of
+// manifest.json that the in-app update checks) and publishes the four files (see README.md).
 // - runtime\ gets node.exe plus npm and npx from next to it, as the official Node.js download has them, so
 //   MCP servers such as "npx -y @azure-devops/mcp" work on a PC without Node.js. A Node.js without npm
 //   (such as Codex's) can only build with --no-npm, for a local test build.
@@ -14,6 +15,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { POWERSHELL } from '../server/windows.js';
 
 const ZIP_NAME = 'Caliope-windows-x64.zip';
 const root = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -61,7 +63,7 @@ fs.writeFileSync(path.join(staging, 'install.ps1'), installer);
 fs.writeFileSync(path.join(dist, 'install.ps1'), installer);
 
 const zip = path.join(dist, ZIP_NAME);
-execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', `Compress-Archive -Path '${path.join(staging, '*').replace(/'/g, "''")}' -DestinationPath '${zip.replace(/'/g, "''")}' -CompressionLevel Optimal`], { stdio: 'inherit' });
+execFileSync(POWERSHELL, ['-NoProfile', '-NonInteractive', '-Command', `Compress-Archive -Path '${path.join(staging, '*').replace(/'/g, "''")}' -DestinationPath '${zip.replace(/'/g, "''")}' -CompressionLevel Optimal`], { stdio: 'inherit' });
 const bytes = fs.readFileSync(zip);
 const manifest = { version, node: process.versions.node, files: { [ZIP_NAME]: { sha256: crypto.createHash('sha256').update(bytes).digest('hex'), size: bytes.length } } };
 fs.writeFileSync(path.join(dist, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`);

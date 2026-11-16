@@ -1,8 +1,9 @@
 // Permissions: whether a tool call may run, and the question to the user when it has to ask first.
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { changePreview } from './tools/fs-tools.js';
-import { commandAllowed, suggestPrefix } from './tools/shell.js';
+import { commandAllowed, readerWithoutFile, suggestPrefix } from './tools/shell.js';
 import { isBrowserReadAction } from './tools/browser.js';
 import { resolvePath, displayPath, isInside } from './tools/paths.js';
 import { protectedPattern } from './protected-files.js';
@@ -16,6 +17,8 @@ import { truncateMiddle } from './util.js';
  * decides per command whether to ask), plan (read only), full (everything runs).
  * - Reading is always allowed, except the files refusedPath names.
  * - Changes outside the project folder ask in every mode except full access.
+ * - In every mode, the browser and web_fetch may not use Caliope's own address, and a command that names
+ *   Caliope's data folder asks.
  * - `agentLabel` names the subagent that asks, so the user knows who it is.
  * - Returns { allowed: true } or { allowed: false, message, stopTurn }.
  */
@@ -30,11 +33,17 @@ export async function authorize(runner, session, tool, toolUse, prepared, signal
     // Looking is free. Opening a new site needs approval once per session. Acting on a page
     // (click, type, keys) needs an approved site (in Auto: the safety check), and always asks in plan mode.
     const action = toolUse.input.action;
-    if (mode === 'full' || isBrowserReadAction(toolUse.input)) return allowed;
+    if (isBrowserReadAction(toolUse.input)) return allowed;
     const host = await tool.targetHost(toolUse.input, ctx);
+    if (isCaliopeSite(host, manager.config.port)) return { allowed: false, message: `${host} is Caliope's own address, which the agent may not open or use.` };
+    if (mode === 'full') return allowed;
+    // An address that is not http(s): the browser tool refuses to open it. An empty tab (about:blank) is on no
+    // site, but a script there still reaches every site, so clicks, typing and scripts need a web page.
+    if (!host && action === 'navigate') return allowed;
+    if (!host) return { allowed: false, message: 'No web page is open in the agent\'s browser, so there is nothing to act on. Open a page with navigate first.' };
     // The action only runs while the page is still on this site (see the browser tool's run).
     ctx.actingHost = host;
-    const hostAllowed = !host || session.data.allowedHosts.includes(host) || manager.projects.get(projectFolderOf(session.meta)).allowedSites.includes(host);
+    const hostAllowed = session.data.allowedHosts.includes(host) || manager.projects.get(projectFolderOf(session.meta)).allowedSites.includes(host);
     // Auto mode opens and clicks and types on pages of this PC, the app being built. Other sites need an
     // approved site or the safety check. Plan mode always asks.
     if (action === 'navigate' && (hostAllowed || (mode === 'auto' && isLocalHost(host)))) return allowed;
@@ -47,7 +56,13 @@ export async function authorize(runner, session, tool, toolUse, prepared, signal
     // Auto mode, a page on another site: its address could carry data out, so the safety check reads every
     // address. Its verdict counts for this page only.
     if (mode === 'auto' && action === 'navigate') {
-      const verdict = await manager.classifyCommand(session, { command: `Open ${toolUse.input.url} in the agent's own browser (load and read the page)`, cwd: '.', description: 'Open a web page', tool: { server: 'built-in', name: 'browser' } }, signal);
+      const check = {
+        command: `Open ${toolUse.input.url} in the agent's own browser (load and read the page)`,
+        cwd: '.',
+        description: 'Open a web page',
+        tool: { server: 'built-in', name: 'browser' },
+      };
+      const verdict = await manager.classifyCommand(session, check, signal);
       if (verdict.decision === 'allow') return allowed;
       const permission = await ask({ ...request, reason: verdict.reason });
       if (permission.allowed) ctx.approvedHost = host;
@@ -55,8 +70,14 @@ export async function authorize(runner, session, tool, toolUse, prepared, signal
     }
     // Auto mode, as in Claude Code: no site approvals. The safety check judges the first action on a site against
     // the user's request. When it fits, the agent acts on that site for the rest of the session.
-    if (mode === 'auto' && host) {
-      const verdict = await manager.classifyCommand(session, { command: `Act on ${host} in the agent's own browser, where the user may be signed in, for the rest of this session (clicks, typing, keys, scripts in the page). First action: ${detail}`, cwd: '.', description: 'Use this site for the user\'s request', tool: { server: 'built-in', name: 'browser' } }, signal);
+    if (mode === 'auto') {
+      const check = {
+        command: `Act on ${host} in the agent's own browser, where the user may be signed in, for the rest of this session (clicks, typing, keys, scripts in the page). First action: ${detail}`,
+        cwd: '.',
+        description: 'Use this site for the user\'s request',
+        tool: { server: 'built-in', name: 'browser' },
+      };
+      const verdict = await manager.classifyCommand(session, check, signal);
       if (verdict.decision === 'allow') {
         session.data.allowedHosts.push(host);
         return allowed;
@@ -93,10 +114,24 @@ export async function authorize(runner, session, tool, toolUse, prepared, signal
     const command = toolUse.input.command;
     const input = typeof toolUse.input.input === 'string' ? toolUse.input.input : null;
     const cwd = toolUse.input.cwd || '.';
-    if (isInside(manager.config.dataDir, resolvePath(session.meta.cwd, cwd))) {
+    const runsIn = resolvePath(session.meta.cwd, cwd);
+    if (isInside(manager.config.dataDir, runsIn)) {
       return { allowed: false, message: 'Commands may not run in Caliope\'s own data folder, which holds the sign-in and the sessions.' };
     }
-    const request = { request: 'command', tool: tool.name, command, description: toolUse.input.description || '', cwd, suggestedPrefix: suggestPrefix(command), input };
+    // Allow rules compare text, so an allowed Get-Content could read Caliope's sign-in or launch secret: a command
+    // that names the data folder always asks, also with full access. A rule could never let it run, so none is offered.
+    const namesData = namesDataFolder(`${command}\n${input || ''}`, manager.config.dataDir, runsIn);
+    const request = {
+      request: 'command',
+      tool: tool.name,
+      command,
+      description: toolUse.input.description || '',
+      cwd,
+      suggestedPrefix: namesData ? null : suggestPrefix(command),
+      input,
+      warning: namesData ? 'This command names Caliope\'s own data folder, which holds the sign-in and the sessions.' : null,
+    };
+    if (namesData) return ask(request);
     if (mode === 'full') return allowed;
     // Plan mode only looks around: every command asks, so nothing changes without the user seeing it.
     if (mode === 'plan') return ask(request);
@@ -115,7 +150,7 @@ export async function authorize(runner, session, tool, toolUse, prepared, signal
     // Publishing: always asks, except with full access.
     if (mode === 'full') return allowed;
     const { remote, branch, uncommitted } = prepared;
-    const request = { request: 'pull_request', tool: tool.name, provider: remote.provider, repository: repositoryName(remote), branch, target: toolUse.input.target_branch || null, draft: Boolean(toolUse.input.draft), uncommitted, title: String(toolUse.input.title || ''), description: truncateMiddle(String(toolUse.input.description || ''), 4000) };
+    const request = { request: 'pull_request', tool: tool.name, provider: remote.provider, repository: repositoryName(remote), branch, target: toolUse.input.target_branch || null, draft: Boolean(toolUse.input.draft), uncommitted, title: String(toolUse.input.title || ''), description: truncateMiddle(String(toolUse.input.description || ''), 4000), reviewers: (toolUse.input.reviewers || []).map(String), workItems: (toolUse.input.work_items || []).map(String) };
     return ask(request);
   }
   if (tool.kind === 'merge') {
@@ -143,6 +178,7 @@ export async function authorize(runner, session, tool, toolUse, prepared, signal
   }
   if (tool.kind === 'web') {
     const host = tool.targetHost(toolUse.input);
+    if (isCaliopeSite(host, manager.config.port)) return { allowed: false, message: `${host} is Caliope's own address, which the agent may not open or use.` };
     const approved = host && ((session.data.fetchHosts || []).includes(host) || session.data.allowedHosts.includes(host));
     if (mode === 'full' || approved) return allowed;
     const request = { request: 'web', tool: tool.name, url: toolUse.input.url || null, query: toolUse.input.query || null, host };
@@ -161,14 +197,20 @@ export async function authorize(runner, session, tool, toolUse, prepared, signal
 
 /**
  * Ask the user about one tool call and apply "allow for this session" or "allow in this project".
+ * - A command rule for a program that prints files must name the file: the card asks again and says so.
  * - Returns { allowed: true } or { allowed: false, message, stopTurn }. A denial without feedback stops the turn.
  */
 export async function askPermission(runner, session, toolUse, request, signal) {
   const manager = runner.manager;
   const answer = await runner.waitForUser({ kind: 'permission', toolUseId: toolUse.id, ...request }, signal);
   if (answer.decision === 'allow') return { allowed: true, answer };
+  const prefix = String(answer.prefix || request.suggestedPrefix || '').trim();
+  // commandAllowed matches such a rule only as that exact command, so a rule like "Get-Content" would never apply.
+  if (request.request === 'command' && (answer.decision === 'allow_project' || answer.decision === 'allow_session') && readerWithoutFile(prefix)) {
+    const again = await askPermission(runner, session, toolUse, { ...request, warning: `"${prefix}" names no file. A rule for a program that prints files must name the file, such as "${prefix} README.md".` }, signal);
+    return again;
+  }
   if (answer.decision === 'allow_project' && request.request === 'command') {
-    const prefix = String(answer.prefix || request.suggestedPrefix || '').trim();
     if (prefix) {
       const folder = projectFolderOf(session.meta);
       const project = manager.projects.get(folder);
@@ -190,7 +232,6 @@ export async function askPermission(runner, session, toolUse, request, signal) {
     if (request.request === 'edit') {
       await manager.changeMode(session, 'edits');
     } else if (request.request === 'command') {
-      const prefix = String(answer.prefix || request.suggestedPrefix || '').trim();
       if (prefix && !session.data.allowRules.some((rule) => rule.toLowerCase() === prefix.toLowerCase())) session.data.allowRules.push(prefix);
     } else if (request.request === 'web' && request.host) {
       // Reading only: a site allowed for web_fetch does not let the browser act on it.
@@ -295,10 +336,13 @@ export function steeringFileWarning(relativePath) {
   return steers ? 'This file gives the agent tools, skills or commands. Changes to it always need your approval.' : null;
 }
 
-/** True when the agent may see pages of `host` without asking: approved in this session or project, or allowed by the mode. */
-export function hostApproved(session, host, projectSites = []) {
+/**
+ * True when the agent may see pages of `host` without asking: approved in this session or project, or allowed by the mode.
+ * - Never Caliope's own address (on `caliopePort`): a page that lands there is not shown, and a batch stops there.
+ */
+export function hostApproved(session, host, projectSites = [], caliopePort = 0) {
   const mode = session.meta.mode;
-  const approved = !host || mode === 'full' || mode === 'auto' || session.data.allowedHosts.includes(host) || projectSites.includes(host);
+  const approved = !isCaliopeSite(host, caliopePort) && (!host || mode === 'full' || mode === 'auto' || session.data.allowedHosts.includes(host) || projectSites.includes(host));
   return approved;
 }
 
@@ -371,4 +415,42 @@ function isLocalHost(site) {
     return false;
   }
   return host === 'localhost' || host === '127.0.0.1' || host === '[::1]' || host.endsWith('.localhost');
+}
+
+/**
+ * True for Caliope's own address: a site on this PC on the port Caliope's server listens on (0 before it listens).
+ * The agent may not use it: Caliope's API sets the mode and answers approvals.
+ */
+function isCaliopeSite(site, port) {
+  if (!port || !isLocalHost(site)) return false;
+  const url = new URL(site);
+  const sitePort = Number(url.port || (url.protocol === 'https:' ? 443 : 80));
+  const own = sitePort === port;
+  return own;
+}
+
+/**
+ * True when the text names Caliope's data folder: its path (also with / or in its real spelling), or the part below
+ * the local app data or home folder written with %LOCALAPPDATA%, $env:LOCALAPPDATA, %USERPROFILE%, $env:USERPROFILE,
+ * $HOME or ~.
+ * - `cwd`: the folder the command runs in. When the data folder is below it, the path from there counts too
+ *   (Caliope\server.json in %LOCALAPPDATA%): followed by \ or /, or as a whole argument.
+ * - It compares text, as allow rules do: a path built from pieces or with wildcards slips past it.
+ */
+function namesDataFolder(text, dataDir, cwd) {
+  // Quotes and braces (${env:LOCALAPPDATA}) leave the path the same, and / and \\ mean \.
+  const normalize = (value) => value.toLowerCase().replace(/["'{}]/g, '').replace(/[\\/]+/g, '\\');
+  const spellings = [dataDir, cachedRealPath(realSignInFolders, dataDir)];
+  for (const [name, parent] of [['LOCALAPPDATA', process.env.LOCALAPPDATA], ['USERPROFILE', os.homedir()]]) {
+    const below = parent && isInside(parent, dataDir) ? path.relative(parent, dataDir) : '';
+    if (!below) continue;
+    spellings.push(`%${name}%\\${below}`, `$env:${name}\\${below}`);
+    if (name === 'USERPROFILE') spellings.push(`$HOME\\${below}`, `~\\${below}`);
+  }
+  const written = normalize(text);
+  // From %LOCALAPPDATA% the path is the single word "Caliope", which other words may contain.
+  const relative = isInside(cwd, dataDir) ? normalize(path.relative(cwd, dataDir)) : '';
+  const namedFromCwd = relative !== '' && (written.includes(`${relative}\\`) || written.split(/\s+/).includes(relative));
+  const named = namedFromCwd || spellings.some((spelling) => written.includes(normalize(spelling)));
+  return named;
 }

@@ -138,10 +138,11 @@ async function route(request, response, url, body) {
   // Pull requests. Caliope signs in with git's credential for the remote. The tests' helper gives "mock-token".
   // Merging: GitHub pull request 7 can be merged, 8 waits for a required check. Azure DevOps pull request 12
   // completes in the background after the PATCH.
-  const githubRepo = /^\/repos\/([^/]+)\/([^/]+)(\/pulls(?:\/(\d+)(\/merge)?)?|\/git\/refs\/heads\/.+)?$/.exec(path);
+  // Reviews: GitHub refuses the reviewer "nobody". Azure DevOps knows ann@example.com, and "Team" matches two groups.
+  const githubRepo = /^\/repos\/([^/]+)\/([^/]+)(\/pulls(?:\/(\d+)(\/merge|\/reviews|\/comments|\/requested_reviewers)?)?|\/issues\/\d+\/comments|\/commits\/[^/]+\/check-runs|\/git\/refs\/heads\/.+)?$/.exec(path);
   if (githubRepo) {
     if (request.headers.authorization !== 'Bearer mock-token') return json(response, 401, { message: 'Bad credentials' });
-    const [, owner, repo, rest, number, merge] = githubRepo;
+    const [, owner, repo, rest, number, part] = githubRepo;
     const pullUrl = (n) => `https://github.com/${owner}/${repo}/pull/${n}`;
     if (!rest) return json(response, 200, { default_branch: 'main', allow_squash_merge: true, allow_merge_commit: true, allow_rebase_merge: false });
     if (rest.startsWith('/git/refs/heads/') && request.method === 'DELETE') {
@@ -149,12 +150,20 @@ async function route(request, response, url, body) {
       response.end();
       return;
     }
-    if (merge && request.method === 'PUT') return json(response, 200, { merged: true, sha: 'f00dfeed0000', message: 'Pull Request successfully merged' });
-    if (number) return json(response, 200, { number: Number(number), title: 'Export invoices as CSV', html_url: pullUrl(number), state: 'open', merged: false, draft: false, mergeable: true, mergeable_state: number === '8' ? 'blocked' : 'clean', head: { ref: 'feature/export', sha: 'abc123def4567890', repo: { full_name: `${owner}/${repo}` } }, base: { ref: 'main' } });
+    if (part === '/merge' && request.method === 'PUT') return json(response, 200, { merged: true, sha: 'f00dfeed0000', message: 'Pull Request successfully merged' });
+    if (part === '/requested_reviewers' && request.method === 'POST') {
+      if (body?.reviewers?.includes('nobody')) return json(response, 422, { message: 'Reviews may only be requested from collaborators.' });
+      return json(response, 201, { number: Number(number), requested_reviewers: (body?.reviewers || []).map((login) => ({ login })) });
+    }
+    if (part === '/reviews') return json(response, 200, [{ user: { login: 'alice' }, state: 'CHANGES_REQUESTED', body: 'Please add a test.', submitted_at: '2026-11-10T09:00:00Z' }]);
+    if (part === '/comments') return json(response, 200, [{ id: 1, user: { login: 'alice' }, body: 'Rename this.', path: 'app.txt', line: 1, created_at: '2026-11-10T09:01:00Z' }, { id: 2, in_reply_to_id: 1, user: { login: 'octo' }, body: 'Done.', path: 'app.txt', line: 1, created_at: '2026-11-10T10:00:00Z' }]);
+    if (rest.startsWith('/issues/')) return json(response, 200, [{ user: { login: 'bob' }, body: 'Looks useful.', created_at: '2026-11-09T12:00:00Z' }]);
+    if (rest.endsWith('/check-runs')) return json(response, 200, { check_runs: [{ name: 'build', status: 'completed', conclusion: 'success' }] });
+    if (number) return json(response, 200, { number: Number(number), title: 'Export invoices as CSV', body: 'Adds the export.', user: { login: 'octo' }, requested_reviewers: [{ login: 'bob' }], html_url: pullUrl(number), state: 'open', merged: false, draft: false, mergeable: true, mergeable_state: number === '8' ? 'blocked' : 'clean', head: { ref: 'feature/export', sha: 'abc123def4567890', repo: { full_name: `${owner}/${repo}` } }, base: { ref: 'main' } });
     if (request.method === 'POST') return json(response, 201, { number: 7, html_url: pullUrl(7) });
     if (request.method === 'GET') return json(response, 200, [{ number: 7, title: 'Export invoices as CSV', html_url: pullUrl(7), user: { login: 'octo' }, head: { ref: 'feature/export' }, base: { ref: 'main' }, draft: false, updated_at: new Date().toISOString() }]);
   }
-  const azureRepo = /^\/ado\/[^/]+\/[^/]+\/_apis\/(?:git\/repositories\/[^/]+(\/pullrequests(?:\/(\d+))?)?|policy\/evaluations)$/.exec(path);
+  const azureRepo = /^\/ado\/[^/]+\/(?:_apis\/identities|[^/]+\/_apis\/(?:git\/repositories\/[^/]+(\/pullrequests(?:\/(\d+)(\/threads|\/workitems)?)?)?|policy\/evaluations))$/.exec(path);
   if (azureRepo) {
     // Azure DevOps answers a refused token with a 203 and its sign-in page.
     if (request.headers.authorization !== `Basic ${Buffer.from(':mock-token').toString('base64')}`) {
@@ -162,8 +171,25 @@ async function route(request, response, url, body) {
       response.end('<html>Sign in</html>');
       return;
     }
-    const [, pullRequests, number] = azureRepo;
-    const pull = () => ({ pullRequestId: 12, title: 'Export invoices as CSV', status: azureCompleted ? 'completed' : 'active', isDraft: false, mergeStatus: 'succeeded', sourceRefName: 'refs/heads/feature/export', targetRefName: 'refs/heads/main', lastMergeSourceCommit: { commitId: 'def4567890abc123' }, ...(azureCompleted ? { lastMergeCommit: { commitId: 'c0ffee000000' } } : {}), repository: { project: { id: 'project-guid' } } });
+    const [, pullRequests, number, detail] = azureRepo;
+    // A search by branch shortens the description, as Azure DevOps does.
+    const pull = (description = 'Adds the export.') => ({ pullRequestId: 12, title: 'Export invoices as CSV', description, createdBy: { displayName: 'Octo' }, reviewers: [{ displayName: 'Ann', vote: 10, isRequired: true }, { displayName: 'Bob', vote: -5 }], status: azureCompleted ? 'completed' : 'active', isDraft: false, mergeStatus: 'succeeded', sourceRefName: 'refs/heads/feature/export', targetRefName: 'refs/heads/main', lastMergeSourceCommit: { commitId: 'def4567890abc123' }, ...(azureCompleted ? { lastMergeCommit: { commitId: 'c0ffee000000' } } : {}), repository: { project: { id: 'project-guid' } } });
+    if (path.endsWith('/_apis/identities')) {
+      const filterValue = url.searchParams.get('filterValue');
+      const found = filterValue === 'ann@example.com' ? [{ id: 'a5b1c2d3-0000-4000-8000-000000000001', providerDisplayName: 'Ann' }] : filterValue === 'Team' ? [{ id: 'team-1' }, { id: 'team-2' }] : [];
+      return json(response, 200, { count: found.length, value: found });
+    }
+    if (detail === '/threads') {
+      const text = (author, content, publishedDate) => ({ author: { displayName: author }, content, commentType: 'text', publishedDate });
+      return json(response, 200, {
+        value: [
+          { id: 1, status: 'active', threadContext: { filePath: '/app.txt', rightFileStart: { line: 1 } }, comments: [text('Ann', 'Please rename this.', '2026-11-10T09:00:00Z'), text('Octo', 'Done.', '2026-11-10T10:00:00Z')] },
+          { id: 2, comments: [{ author: { displayName: 'Azure DevOps' }, content: 'Ann voted 10', commentType: 'system' }] },
+          { id: 3, isDeleted: true, comments: [text('Bob', 'Deleted thread.', '2026-11-10T11:00:00Z')] },
+        ],
+      });
+    }
+    if (detail === '/workitems') return json(response, 200, { value: [{ id: '101' }] });
     if (path.endsWith('/policy/evaluations')) return json(response, 200, { value: [{ status: 'approved', configuration: { isBlocking: true, isEnabled: true, type: { displayName: 'Minimum number of reviewers' } } }, { status: 'running', configuration: { isBlocking: false, isEnabled: true, type: { displayName: 'Build' } } }] });
     if (!pullRequests) return json(response, 200, { defaultBranch: 'refs/heads/main' });
     if (number && request.method === 'PATCH') {
@@ -173,7 +199,7 @@ async function route(request, response, url, body) {
     }
     if (number) return json(response, 200, pull());
     if (request.method === 'POST') return json(response, 201, { pullRequestId: 12 });
-    if (request.method === 'GET') return json(response, 200, { value: [pull()] });
+    if (request.method === 'GET') return json(response, 200, { value: [pull('Adds the')] });
   }
 
   // Copilot API endpoints: a PAT or an app user token directly (the Copilot CLI/SDK way).
@@ -286,7 +312,7 @@ function plan(body) {
   if (/may run without asking the user first/.test(system)) {
     // Auto-mode safety check: allow harmless commands, ask about deletes and anything unknown.
     const promptText = normalizedMessages(body)[0]?.texts.join('\n') || '';
-    const command = (/<command>\n([\s\S]*?)\n<\/command>/.exec(promptText) || [])[1] || '';
+    const command = (/<command(?:-\w+)?>\n([\s\S]*?)\n<\/command(?:-\w+)?>/.exec(promptText) || [])[1] || '';
     const safe = /^(Get-Content|Get-ChildItem|git (status|diff|log)|echo|Write-Output|dir)\b/i.test(command.trim());
     return { text: JSON.stringify(safe ? { decision: 'allow', reason: 'Reads information only.' } : { decision: 'ask', reason: 'This command deletes or changes things outside a simple read.' }) };
   }

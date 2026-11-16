@@ -26,6 +26,7 @@ const TOOL_ICONS = {
   run_agent: 'sparkles',
   create_pull_request: 'git-branch',
   merge_pull_request: 'git-branch',
+  read_pull_request: 'git-pull-request',
   schedule: 'history',
   search_sessions: 'text-search',
   read_session: 'history',
@@ -47,6 +48,12 @@ export class Transcript {
     this.toolCards = new Map();
     this.liveFrame = null;
     this.statusTimer = null;
+    this.resetTurn();
+  }
+
+  /** A user prompt starts a turn. The prompt is what Rewind goes back to when the model declines it. */
+  resetTurn(promptId = null) {
+    this.turn = { promptId, stopReason: null };
   }
 
   /** Render a whole session. */
@@ -54,6 +61,7 @@ export class Transcript {
     clear(this.messagesElement);
     this.toolCards.clear();
     this.liveElement = null;
+    this.resetTurn();
     const messages = active.messages;
     if (messages.length === 0) {
       this.messagesElement.append(
@@ -127,6 +135,7 @@ export class Transcript {
       .join('\n\n');
     const images = message.content.filter((block) => block.type === 'image');
     if (!visibleText && images.length === 0) return null;
+    this.resetTurn(message.auto ? null : message.id);
     const attachmentBlock = message.content.find((block) => block.attachment);
     const attached = attachmentBlock ? [...attachmentBlock.text.matchAll(/<file path="([^"]+)">/g)].map((match) => match[1]) : [];
     const bubble = h(
@@ -174,21 +183,32 @@ export class Transcript {
     ]
       .filter(Boolean)
       .join(' · ');
+    this.turn.stopReason = message.stopReason || null;
+    // An answer without tool calls ends the turn: show what the whole turn cost under it.
+    const spent = message.content.some((block) => block.type === 'tool_use') ? null : turnCost(state.active?.messages || [], message);
+    if (spent?.requests > 0) {
+      const cost = formatCost(spent.nanoAiu, state.settings?.costUnit, { unpriced: spent.unpriced });
+      const scope = spent.subagents > 0 ? 'this turn, with subagents' : 'this turn';
+      element.append(h('div', { class: 'turn-cost', title: `This answer: ${detail}` }, `${modelLabel(message.model)} · ${pluralize(spent.requests, 'request')} · ${cost} ${scope}`));
+    }
     const actions = h('div', { class: 'msg-actions' });
     if (texts.length) actions.append(actionButton('copy', 'Copy answer', () => copyText(texts.join('\n\n')).then(() => toast('Copied.'))));
-    actions.append(h('span', { class: 'btn ghost small icon-only', title: detail, html: icon('info', 14) }));
+    actions.append(h('span', { class: 'btn ghost small icon-only', title: detail, 'aria-label': detail, role: 'img', tabindex: '0', html: icon('info', 14) }));
     element.prepend(actions);
     return element;
   }
 
   renderEvent(message) {
-    const time = new Date(message.ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    const time = new Date(message.ts).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
     switch (message.kind) {
       case 'error': {
         const box = h('div', { class: 'event-error-box' }, h('span', { html: icon('circle-alert', 16) }), h('div', { class: 'grow' }, h('div', {}, message.text), h('div', { class: 'faint', style: { fontSize: '11.5px' } }, time)));
         if (message.auth) box.append(h('button', { class: 'btn small', onClick: () => this.handlers.onSignIn() }, 'Sign in'));
         if (message.limitProject) box.append(h('button', { class: 'btn small', onClick: () => this.handlers.onOpenProject(message.limitProject) }, 'Open project'));
         if (!message.auth && message.retryable) box.append(h('button', { class: 'btn small', onClick: () => this.handlers.onRetry() }, h('span', { html: icon('refresh-cw', 13) }), 'Retry'));
+        // The model declined the prompt: Rewind puts it back in the message box to rephrase.
+        const promptId = this.turn.promptId;
+        if (this.turn.stopReason === 'refusal' && promptId) box.append(h('button', { class: 'btn small', title: 'Put your message back in the box to rephrase it', onClick: () => this.handlers.onRewind(promptId) }, h('span', { html: icon('rotate-ccw', 13) }), 'Rewind'));
         return box;
       }
       case 'notice':
@@ -314,6 +334,35 @@ export class Transcript {
   }
 }
 
+/**
+ * What the turn that `message` ends cost, from the session's messages back to the user's prompt.
+ * - Counts the agent's requests, and the requests of the subagents it ran (their run_agent results carry them).
+ * - Returns { nanoAiu, requests, unpriced, subagents }.
+ */
+function turnCost(messages, message) {
+  const cost = { nanoAiu: 0, requests: 0, unpriced: 0, subagents: 0 };
+  for (let index = messages.findIndex((item) => item.id === message.id); index >= 0; index--) {
+    const item = messages[index];
+    if (item.role === 'assistant' && item.usage) {
+      cost.requests++;
+      if (typeof item.usage.nanoAiu === 'number') cost.nanoAiu += item.usage.nanoAiu;
+      else cost.unpriced++;
+    } else if (item.role === 'user' && item.kind === 'tool_results') {
+      for (const block of item.content) {
+        if (typeof block.meta?.steps !== 'number') continue;
+        cost.subagents++;
+        cost.requests += block.meta.steps;
+        cost.nanoAiu += block.meta.nanoAiu || 0;
+        cost.unpriced += block.meta.unpriced || 0;
+      }
+    } else if (item.role === 'user' && item.kind !== 'compact_summary' && item.content.some((block) => (block.type === 'text' && !block.hidden && block.text) || block.type === 'image')) {
+      // The prompt that started the turn.
+      break;
+    }
+  }
+  return cost;
+}
+
 /** A compaction the model did itself: Claude's summary can be read; OpenAI keeps its summary encrypted. */
 function compactionCard(block) {
   if (!block.content) return h('div', { class: 'event' }, h('span', { html: icon('layers', 13) }), ' Earlier conversation compacted by the model. OpenAI keeps this summary encrypted, so it cannot be shown.');
@@ -389,6 +438,8 @@ function describe(toolUse) {
       return { verb: 'Pull request', target: input.title, code: false, extra: input.target_branch ? `into ${input.target_branch}` : '' };
     case 'merge_pull_request':
       return { verb: 'Merge', target: input.number ? `pull request ${input.number}` : 'the pull request for this branch', code: false };
+    case 'read_pull_request':
+      return { verb: 'Read pull request', target: input.number ? `#${input.number}` : 'for this branch', code: false };
     case 'schedule':
       return { verb: input.action === 'delete' ? 'Unschedule' : input.action === 'list' ? 'Scheduled tasks' : 'Schedule', target: input.name || input.id || '', code: false };
     case 'search_sessions':
@@ -529,7 +580,9 @@ class ToolCard {
         else if (meta.exitCode !== undefined && meta.exitCode !== null) fragment.append(meta.durationMs ? `exit ${meta.exitCode} · ${(meta.durationMs / 1000).toFixed(1)} s` : `exit ${meta.exitCode}`);
         break;
       case 'grep':
-        if (meta.matches !== undefined) fragment.append(`${pluralize(meta.matches, 'match', 'matches')} in ${pluralize(meta.files, 'file')}`);
+        // A search that stopped early (`more`) found at least these counts.
+        if (meta.more) fragment.append(`${meta.matches}+ matches in ${meta.files}+ files`);
+        else if (meta.matches !== undefined) fragment.append(`${pluralize(meta.matches, 'match', 'matches')} in ${pluralize(meta.files, 'file')}`);
         break;
       case 'glob':
         if (meta.count !== undefined) fragment.append(pluralize(meta.count, 'file'));
@@ -573,11 +626,14 @@ class ToolCard {
       case 'run_command': {
         const header = h('pre', { class: 'mono', style: { borderBottom: '1px solid var(--border)', color: 'var(--text-muted)' } }, `> ${input.command || ''}${input.cwd ? `\n(in ${input.cwd})` : ''}`);
         this.body.append(header);
-        const text = result ? (meta.output !== undefined ? meta.output : resultText) : this.output;
+        // A command that ran has a status line, then its output. Older sessions keep the output in meta.output.
+        const ran = meta.output !== undefined || meta.exitCode !== undefined;
+        const commandOutput = meta.output !== undefined ? meta.output : resultText.slice(resultText.indexOf('\n') + 1);
+        const text = result ? (ran ? commandOutput : resultText) : this.output;
         // Hidden until there is output: a command waiting for approval has none yet.
         this.outputElement = h('pre', { hidden: !text && !result }, text || (result ? '(no output)' : ''));
         this.body.append(this.outputElement);
-        if (result && result.is_error && meta.output === undefined) this.outputElement.classList.add('danger-text');
+        if (result && result.is_error && !ran) this.outputElement.classList.add('danger-text');
         return;
       }
       case 'edit_file':

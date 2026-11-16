@@ -48,11 +48,12 @@ export class AuthManager {
     }
     try {
       const githubToken = stored.token.dpapi ? await unprotectSecret(stored.token.dpapi) : stored.token.plain;
-      if (!githubToken) throw new Error('empty token');
+      if (!githubToken) throw new Error('The token is empty.');
       this.record = { kind: stored.kind, githubToken, login: stored.login || null, savedAt: stored.savedAt, remembered: true };
     } catch (error) {
+      // Another Windows user's sign-in, an empty token, or a Node.js without node:ffi (see callDpapi): the message says which.
       this.log.warn('Saved token could not be decrypted.', error);
-      this.loadError = 'The saved sign-in could not be decrypted for this Windows user. Sign in again.';
+      this.loadError = `The saved sign-in could not be decrypted. ${error.message} Sign in again.`;
     }
   }
 
@@ -63,8 +64,8 @@ export class AuthManager {
       login: this.record?.login || null,
       savedAt: this.record?.savedAt || null,
       remembered: Boolean(this.record?.remembered),
-      // True when "remember" was asked but Windows' encryption could not run (restricted PowerShell).
-      saveFailed: Boolean(this.record?.saveFailed),
+      // Why "remember" was asked but the sign-in was not saved, or null.
+      saveFailed: this.record?.saveFailed || null,
       error: this.record ? null : this.loadError,
       device: this.device
         ? {
@@ -253,10 +254,10 @@ export class AuthManager {
         await writeJsonAtomic(this.file, { kind: record.kind, login: record.login, savedAt: record.savedAt, token });
         remembered = true;
       } catch (error) {
-        // The encryption runs through PowerShell. Where a company restricts it (Constrained Language Mode),
-        // the sign-in lasts until Caliope closes instead of failing.
+        // Windows encrypts it inside Caliope's own Node.js (node:ffi, Node.js 26.1 and later). When it can't,
+        // for example running from source on an older Node.js, the sign-in lasts until Caliope closes instead of failing.
         this.log.warn('The sign-in could not be saved encrypted; it lasts until Caliope closes.', error.message);
-        record.saveFailed = true;
+        record.saveFailed = error.message;
       }
     }
     if (!remembered) await writeJsonAtomic(this.file, {});

@@ -15,7 +15,7 @@ import fsp from 'node:fs/promises';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { StringDecoder } from 'node:string_decoder';
-import { agentBrowser, killProcessTree, copyImageToClipboard, runPowerShell, focusWindow } from '../windows.js';
+import { agentBrowser, killProcessTree, copyImageToClipboard, virtualScreenLeft, focusWindow } from '../windows.js';
 import { sleep, sha256, abortError, isAbortError, siteOf } from '../util.js';
 import { ToolInputError } from './fs-tools.js';
 import { pathKey } from './paths.js';
@@ -242,9 +242,8 @@ export class AgentBrowser {
 
   /** A window position left of every screen: windows there keep drawing without being in the way. */
   hiddenLeft() {
-    this.hiddenLeftValue ??= runPowerShell('Add-Type -AssemblyName System.Windows.Forms\n[System.Windows.Forms.SystemInformation]::VirtualScreen.Left', { timeoutMs: 20000 })
-      .then((output) => {
-        const screenLeft = Number(output.trim());
+    this.hiddenLeftValue ??= virtualScreenLeft()
+      .then((screenLeft) => {
         const left = Number.isFinite(screenLeft) ? screenLeft - WINDOW_SIZE.width - 200 : -3000;
         return left;
       })
@@ -837,7 +836,10 @@ export const browserTool = {
     },
     required: ['action'],
   },
-  /** Site (scheme, host and port) the action will act on: the target for navigate, otherwise the current page. */
+  /**
+   * Site (scheme, host and port) the action will act on: the target for navigate, otherwise the current page.
+   * - null when that is no http(s) page: no tab yet, an empty tab (about:blank), or an address such as file: or data:.
+   */
   async targetHost(input, ctx) {
     if (input.action === 'navigate') return siteOf(input.url);
     const browser = ctx.browser;

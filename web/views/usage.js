@@ -1,5 +1,5 @@
-// Spending page: Copilot allowance, what this app spent (by day, session, model, purpose).
-import { h, clear, formatCost, formatCredits, formatTokens, relativeTime, onNextFrame } from '../lib/dom.js';
+// Spending page: Copilot allowance, what this app spent (by day, project, session, model, purpose).
+import { h, clear, formatCost, formatCredits, formatTokens, relativeTime, onNextFrame, pluralize } from '../lib/dom.js';
 import { icon } from '../lib/icons.js';
 import { api } from '../lib/api.js';
 import { state, on, modelLabel } from '../lib/store.js';
@@ -46,7 +46,8 @@ export function mountUsage(container) {
     resizeObserver?.disconnect();
     content.append(allowanceCard());
     const periods = h('div', { class: 'segmented' }, PERIODS.map(([id, label]) => h('button', { class: period === id ? 'active' : '', onClick: () => { period = id; load(); } }, label)));
-    content.append(h('div', { class: 'row', style: { margin: '26px 0 12px' } }, h('h2', { style: { margin: 0 }, class: 'grow' }, 'Spent in Caliope'), periods));
+    const exportButton = h('button', { class: 'btn small', type: 'button', title: 'Download the spending per session in this period as a CSV file', disabled: !summary, onClick: exportCsv }, h('span', { html: icon('download', 13) }), 'Export CSV');
+    content.append(h('div', { class: 'row', style: { margin: '26px 0 12px', flexWrap: 'wrap' } }, h('h2', { style: { margin: 0 }, class: 'grow' }, 'Spent in Caliope'), periods, exportButton));
     if (!summary) {
       content.append(h('div', { class: 'faint' }, 'Loading…'));
       return;
@@ -56,16 +57,109 @@ export function mountUsage(container) {
       h(
         'div',
         { class: 'grid-2' },
-        statTile(formatCost(total.nanoAiu, unit(), { unpriced: total.unpricedRequests }), unit() === 'usd' ? formatCost(total.nanoAiu, 'credits') : formatCost(total.nanoAiu, 'usd'), `Spent · ${total.requests} requests`),
+        statTile(formatCost(total.nanoAiu, unit(), { unpriced: total.unpricedRequests }), unit() === 'usd' ? formatCost(total.nanoAiu, 'credits') : formatCost(total.nanoAiu, 'usd'), `Spent · ${pluralize(total.requests, 'request')}`),
         statTile(formatTokens(total.input + total.cacheRead + total.cacheWrite), `${formatTokens(total.cacheRead)} read from cache`, 'Input tokens'),
         statTile(formatTokens(total.output), 'including thinking', 'Output tokens'),
       ),
     );
     if (total.unpricedRequests > 0) {
-      content.append(h('div', { class: 'callout warn', style: { marginTop: '10px' } }, h('span', { html: icon('info', 15) }), `${total.unpricedRequests} request(s) came back without a cost from Copilot. They are counted but not priced, so the real total is at least what is shown.`));
+      content.append(h('div', { class: 'callout warn', style: { marginTop: '10px' } }, h('span', { html: icon('info', 15) }), `${pluralize(total.unpricedRequests, 'request')} came back without a cost from Copilot. They are counted but not priced, so the real total is at least what is shown.`));
     }
+    const limit = limitCard();
+    if (limit) content.append(limit);
     content.append(dailyCard());
+    content.append(h('h2', {}, 'By project'), projectsTable());
     content.append(h('h2', {}, 'By session'), sessionsTable(), h('div', { class: 'grid-2', style: { marginTop: '16px' } }, h('div', {}, h('h2', { style: { marginTop: 0 } }, 'By model'), modelsTable()), h('div', {}, h('h2', { style: { marginTop: 0 } }, 'By purpose'), kindsTable())));
+  }
+
+  /**
+   * The monthly limit for all of Caliope (Settings), and whether requests without a cost keep the limits from
+   * being fully enforced. Both count this calendar month, whatever period is shown.
+   */
+  function limitCard() {
+    const limit = state.settings?.creditLimit || 0;
+    const projectLimits = (summary.byProject || []).some((project) => project.creditLimit > 0);
+    const unpriced = summary.unpricedThisMonth || 0;
+    if (!limit && !(projectLimits && unpriced > 0)) return null;
+    const card = h('div', { class: 'card', style: { marginTop: '12px' } });
+    if (limit) {
+      const spentCredits = (summary.spentThisMonth || 0) / 1e9;
+      const share = Math.min(1, spentCredits / limit);
+      card.append(
+        h('div', { class: 'row' }, h('strong', { class: 'grow' }, 'Monthly limit for Caliope'), h('span', {}, `${formatCost(summary.spentThisMonth || 0, unit(), { unpriced })} of ${formatCredits(limit, unit())} this month`), h('button', { class: 'btn ghost small', type: 'button', onClick: () => actions.showView('settings') }, 'Change')),
+        h('div', { class: `meter${share >= 1 ? ' over' : share >= 0.8 ? ' warn' : ''}`, role: 'meter', 'aria-valuemin': '0', 'aria-valuemax': String(limit), 'aria-valuenow': spentCredits.toFixed(2), 'aria-label': 'Spent this month' }, h('div', { style: { width: `${(share * 100).toFixed(1)}%` } })),
+      );
+    }
+    if (unpriced > 0) {
+      card.append(h('div', { class: 'callout warn', style: { marginTop: limit ? '8px' : '0' } }, h('span', { html: icon('triangle-alert', 15) }), `${pluralize(unpriced, 'request')} this month came back without a cost from Copilot, so the monthly limits can't be fully enforced: those requests are not counted.`));
+    }
+    return card;
+  }
+
+  /** Each project's spending in the period, with its monthly limit and how much of it this month used. */
+  function projectsTable() {
+    const projects = summary.byProject || [];
+    if (projects.length === 0) return h('div', { class: 'faint' }, 'No projects in this period.');
+    const status = (project) => {
+      if (!project.creditLimit) return h('span', { class: 'faint' }, 'No limit');
+      const share = project.spentThisMonth / 1e9 / project.creditLimit;
+      if (share >= 1) return h('span', { class: 'danger-text' }, 'Limit reached');
+      const text = `${Math.floor(share * 100)}% used this month${project.unpricedThisMonth ? ', not fully enforced' : ''}`;
+      return h('span', { class: share >= 0.8 || project.unpricedThisMonth ? 'warning-text' : '' }, text);
+    };
+    const table = h(
+      'div',
+      { class: 'card', style: { padding: '4px 8px' } },
+      h(
+        'table',
+        { class: 'data-table' },
+        h('thead', {}, h('tr', {}, h('th', {}, 'Project'), h('th', { class: 'num' }, 'Requests'), h('th', { class: 'num' }, 'Spent'), h('th', { class: 'num' }, 'Monthly limit'), h('th', {}, 'Status'))),
+        h(
+          'tbody',
+          {},
+          projects.map((project) =>
+            h(
+              'tr',
+              { class: 'clickable', title: project.folder, onClick: () => actions.openProject(project.folder) },
+              h('td', {}, h('a', { href: '#', onClick: (event) => event.preventDefault() }, project.name)),
+              h('td', { class: 'num' }, String(project.requests)),
+              h('td', { class: 'num' }, formatCost(project.nanoAiu, unit(), { unpriced: project.unpricedRequests })),
+              h('td', { class: 'num' }, project.creditLimit ? formatCredits(project.creditLimit, unit()) : '—'),
+              h('td', {}, status(project)),
+            ),
+          ),
+        ),
+      ),
+    );
+    return table;
+  }
+
+  /**
+   * Download the period's spending per session as a .csv file for Excel.
+   * - UTF-16LE with a byte order mark, and a tab between the cells: Excel opens that with the right characters and
+   *   columns in every locale. With UTF-8 it needs a `sep=` line for Belgian or Dutch settings, and then it ignores
+   *   the byte order mark, so accented titles break.
+   * - A cell that starts with =, +, - or @ gets a leading ', so Excel shows it as text instead of running it as a formula.
+   * - A cell with a tab, a quote or a line break is quoted.
+   */
+  function exportCsv() {
+    const quote = (value) => {
+      const text = String(value ?? '');
+      const safeText = /^[=+\-@]/.test(text) ? `'${text}` : text;
+      const quoted = /[\t"\r\n]/.test(safeText) ? `"${safeText.replace(/"/g, '""')}"` : safeText;
+      return quoted;
+    };
+    const header = ['Session', 'Project folder', 'Requests', 'Requests without a cost', 'Input tokens', 'Output tokens', 'AI credits', 'US dollars'];
+    const lines = summary.bySession.map((row) => [row.title, row.project || row.cwd || '', row.requests, row.unpricedRequests, row.input + row.cacheRead + row.cacheWrite, row.output, (row.nanoAiu / 1e9).toFixed(4), (row.nanoAiu / 1e11).toFixed(6)].map(quote).join('\t'));
+    const csv = `﻿${[header.map(quote).join('\t'), ...lines].join('\r\n')}\r\n`;
+    // One UTF-16 code unit per element. Windows PCs are little-endian, so the bytes come out as UTF-16LE.
+    const utf16 = Uint16Array.from({ length: csv.length }, (_, index) => csv.charCodeAt(index));
+    const url = URL.createObjectURL(new Blob([utf16], { type: 'text/csv;charset=utf-16le' }));
+    const link = h('a', { href: url, download: `caliope-spending-${period}-${new Date().toISOString().slice(0, 10)}.csv` });
+    document.body.append(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
   }
 
   function statTile(value, secondary, label) {
@@ -110,7 +204,7 @@ export function mountUsage(container) {
     const credits = allowance.tokenBased !== false;
     const used = allowance.used ?? Math.max(0, allowance.entitlement - (allowance.remaining ?? 0));
     const percentUsed = Math.min(100, Math.max(0, (used / allowance.entitlement) * 100));
-    const amount = (value) => (credits ? formatCredits(value, unit()) : `${Math.round(value).toLocaleString()} requests`);
+    const amount = (value) => (credits ? formatCredits(value, unit()) : `${Math.round(value).toLocaleString('en-US')} ${Math.round(value) === 1 ? 'request' : 'requests'}`);
     const meterClass = percentUsed >= 100 ? 'meter over' : percentUsed >= 80 ? 'meter warn' : 'meter';
     card.append(
       h(
@@ -124,7 +218,7 @@ export function mountUsage(container) {
         'div',
         { class: 'row faint', style: { fontSize: '12.5px', flexWrap: 'wrap' } },
         h('span', {}, `${Math.round(percentUsed)}% used`),
-        allowance.resetDate ? h('span', {}, `· resets ${new Date(allowance.resetDate).toLocaleDateString(undefined, { day: 'numeric', month: 'long', year: 'numeric' })}`) : null,
+        allowance.resetDate ? h('span', {}, `· resets ${new Date(allowance.resetDate).toLocaleDateString('en-US', { day: 'numeric', month: 'long', year: 'numeric' })}`) : null,
         planLine ? h('span', {}, `· ${planLine}`) : null,
         allowance.overagePermitted ? h('span', {}, `· extra use beyond the allowance is allowed${allowance.overageCount ? ` (${allowance.overageCount} so far)` : ''}`) : null,
       ),
@@ -261,7 +355,7 @@ export function mountUsage(container) {
             h(
               'tr',
               { class: row.exists ? 'clickable' : '', title: row.exists ? 'Open session' : 'This session was deleted', onClick: () => row.exists && actions.openSession(row.sessionId) },
-              h('td', { class: row.exists ? '' : 'faint' }, row.title),
+              h('td', { class: row.exists ? '' : 'faint' }, row.exists ? h('a', { href: '#', onClick: (event) => event.preventDefault() }, row.title) : row.title),
               h('td', { class: 'faint ellipsis', style: { maxWidth: '220px' }, title: row.cwd || '' }, row.cwd ? row.cwd.split(/[\\/]/).pop() : ''),
               h('td', { class: 'num' }, String(row.requests)),
               h('td', { class: 'num' }, `${formatTokens(row.input + row.cacheRead + row.cacheWrite)} / ${formatTokens(row.output)}`),
@@ -313,5 +407,5 @@ function niceMax(value) {
 
 function formatDay(day, long = false) {
   const date = new Date(`${day}T00:00:00`);
-  return date.toLocaleDateString(undefined, long ? { weekday: 'short', day: 'numeric', month: 'short' } : { day: 'numeric', month: 'short' });
+  return date.toLocaleDateString('en-US', long ? { weekday: 'short', day: 'numeric', month: 'short' } : { day: 'numeric', month: 'short' });
 }

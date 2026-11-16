@@ -1,6 +1,7 @@
 // Projects (one per folder), kept in Caliope's data folder so nothing is written into the user's repositories.
+import fsp from 'node:fs/promises';
 import path from 'node:path';
-import { readJson, writeJsonAtomic } from './util.js';
+import { readJson, writeJsonAtomic, KeyedQueue } from './util.js';
 import { pathKey } from './tools/paths.js';
 
 // Project memory goes into every new session's system prompt (cached, so cheap), so it stays small.
@@ -16,13 +17,23 @@ export function projectFolderOf(meta) {
 }
 
 export class ProjectStore {
-  constructor(file) {
+  constructor(file, log) {
     this.file = file;
+    this.log = log;
     this.projects = {};
+    // Saves run one after another, so the file always ends with the latest projects.
+    this.queue = new KeyedQueue();
   }
 
   async load() {
-    this.projects = (await readJson(this.file, {}).catch(() => ({}))) || {};
+    try {
+      this.projects = (await readJson(this.file, {})) || {};
+    } catch (error) {
+      // A damaged file should not stop the app. The next change overwrites it, so keep a copy first.
+      this.log?.warn('Projects file could not be read; starting without project settings.', error);
+      await fsp.copyFile(this.file, `${this.file}.damaged`).catch(() => {});
+      this.projects = {};
+    }
   }
 
   /**
@@ -77,7 +88,7 @@ export class ProjectStore {
       schedules: Array.isArray(schedules) ? schedules : current.schedules || [],
       updatedAt: new Date().toISOString(),
     };
-    await writeJsonAtomic(this.file, this.projects);
+    await this.queue.run(this.file, () => writeJsonAtomic(this.file, this.projects));
     return this.get(folder);
   }
 }

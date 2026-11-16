@@ -30,8 +30,7 @@ export function mountPullRequests(container) {
       const result = await api.get('/api/pull-requests');
       if (!destroyed) render(result);
     } catch (error) {
-      clear(content);
-      toastError(error);
+      clear(content).append(h('div', { class: 'callout error' }, h('span', { html: icon('circle-alert', 16) }), h('div', { class: 'grow' }, `The pull requests could not be loaded: ${error.message}`), h('button', { class: 'btn small', type: 'button', onClick: load }, 'Try again')));
     } finally {
       refreshButton.disabled = false;
     }
@@ -39,7 +38,17 @@ export function mountPullRequests(container) {
 
   function render({ repositories, hidden }) {
     clear(content);
-    if (repositories.length === 0) content.append(h('div', { class: 'card faint' }, 'None of your trusted projects has a GitHub or Azure DevOps repository as its origin.'));
+    if (repositories.length === 0) {
+      content.append(
+        h(
+          'div',
+          { class: 'card' },
+          h('p', { class: 'muted', style: { marginTop: 0 } }, 'None of your trusted projects has a GitHub or Azure DevOps repository as its origin.'),
+          h('p', { class: 'muted' }, 'Start a session in a folder you cloned from GitHub or Azure DevOps and trust the folder when Caliope asks. Its open pull requests then show here.'),
+          h('button', { class: 'btn small primary', type: 'button', onClick: () => actions.showView('new') }, h('span', { html: icon('plus', 13) }), 'New session'),
+        ),
+      );
+    }
     for (const repository of repositories) content.append(repositoryCard(repository));
     if (hidden > 0) content.append(h('p', { class: 'faint', style: { fontSize: '13px', marginTop: '14px' } }, `${hidden} ${hidden === 1 ? 'project is' : 'projects are'} left out because ${hidden === 1 ? 'it is' : 'they are'} not trusted or the folder is gone. Trust a project on its page to see its pull requests.`));
   }

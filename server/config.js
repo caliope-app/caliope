@@ -21,6 +21,14 @@ export const RELEASES_URL = `${packageInfo.repository.url.replace(/\.git$/, '')}
 // one, only personal access tokens work. A client ID is public. It is not a secret.
 export const GITHUB_OAUTH_CLIENT_ID = 'Ov23lincmhY0oGK4DqDU';
 
+// Ed25519 key that checks the signature of a release's manifest.json (manifest.json.sig) before an update installs.
+// The release workflow signs with the matching private key, the CALIOPE_SIGNING_KEY secret. A fork needs a key
+// pair of its own.
+export const RELEASE_PUBLIC_KEY = `-----BEGIN PUBLIC KEY-----
+MCowBQYDK2VwAyEA6DamfyTwD6hhu3wpfs9wAWSB+6f3oHUAX1nZybIPJ3w=
+-----END PUBLIC KEY-----
+`;
+
 function parseArgs(argv) {
   const args = {};
   for (let i = 0; i < argv.length; i++) {
@@ -53,9 +61,11 @@ export function loadConfig(argv = process.argv.slice(2), env = process.env) {
     logsDir: path.join(dataDir, 'logs'),
     tmpDir: path.join(dataDir, 'tmp'),
     port: Number(args.port || env.CALIOPE_PORT || 0),
-    open: Boolean(args.open),
-    // --stay keeps the server running when no window is connected.
-    stay: Boolean(args.stay) || !args.open,
+    // --background (the Startup entry of "Keep running for scheduled tasks") starts without a window.
+    open: Boolean(args.open) && !args.background,
+    // --stay keeps the server running when no window is connected, and so does a start without --open (development).
+    // A --background start closes like a normal one, unless "Keep running for scheduled tasks" is on.
+    stay: Boolean(args.stay) || (!args.open && !args.background),
     githubWeb: trimSlash(testEnv.CALIOPE_GITHUB_WEB || 'https://github.com'),
     githubApi: trimSlash(testEnv.CALIOPE_GITHUB_API || 'https://api.github.com'),
     apiBaseOverride: testEnv.CALIOPE_API_BASE ? trimSlash(testEnv.CALIOPE_API_BASE) : null,

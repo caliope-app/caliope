@@ -1,8 +1,21 @@
-// Windows integration: DPAPI secrets, the folder picker, Explorer, the app window, and process trees.
+// Windows integration: DPAPI secrets, Explorer, the app window, the Startup entry, and process trees.
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn, execFileSync } from 'node:child_process';
+import { setTimeout as sleep } from 'node:timers/promises';
+
+// Windows' own programs run by their full path, so a program of the same name in the current folder or on PATH
+// never runs instead.
+const WINDOWS_FOLDER = process.env.SystemRoot || 'C:\\Windows';
+
+/** The full path of one of Windows' own programs in System32, such as reg.exe. */
+export function systemProgram(name) {
+  const program = path.join(WINDOWS_FOLDER, 'System32', name);
+  return program;
+}
+
+export const POWERSHELL = systemProgram('WindowsPowerShell\\v1.0\\powershell.exe');
 
 /**
  * Run a PowerShell script with text on stdin and return stdout.
@@ -17,7 +30,7 @@ export function runPowerShell(script, { input = '', sta = false, timeoutMs = 600
     // UTF-8 both ways: a folder or user name such as "José" must survive stdin and stdout.
     const command = `[Console]::InputEncoding=[System.Text.UTF8Encoding]::new($false)\n[Console]::OutputEncoding=[System.Text.Encoding]::UTF8\n${script}`;
     args.push('-Command', command);
-    const child = spawn('powershell.exe', args, { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
+    const child = spawn(POWERSHELL, args, { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
     const stdout = [];
     const stderr = [];
     const timer = setTimeout(() => {
@@ -130,22 +143,60 @@ export async function renderPdfPages(file, { first, last, width = 1200 }) {
   return result;
 }
 
+// node:ffi calls Windows functions inside this process, without PowerShell. It comes with Node.js 26.1 and later,
+// so with the release zip. Running from source on an older Node.js, it is null.
+const ffi = await import('node:ffi').catch(() => null);
+let windowsLibraries = null;
+
 // CryptProtectData and CryptUnprotectData take the same arguments.
 const DPAPI_SIGNATURE = { return: 'int32', arguments: ['buffer', 'pointer', 'pointer', 'pointer', 'pointer', 'uint32', 'buffer'] };
 const CRYPTPROTECT_UI_FORBIDDEN = 1;
+const SM_XVIRTUALSCREEN = 76;
+
+/**
+ * The Windows functions Caliope calls through node:ffi, loaded once, on first use.
+ * - A handle or pointer is a bigint, a BOOL an int32. Text goes in as a Buffer from wideString.
+ */
+function windowsApi() {
+  windowsLibraries ??= {
+    crypt32: ffi.dlopen('crypt32.dll', { CryptProtectData: DPAPI_SIGNATURE, CryptUnprotectData: DPAPI_SIGNATURE }),
+    kernel32: ffi.dlopen('kernel32.dll', { LocalFree: { return: 'pointer', arguments: ['pointer'] } }),
+    user32: ffi.dlopen('user32.dll', {
+      FindWindowExW: { return: 'pointer', arguments: ['pointer', 'pointer', 'pointer', 'pointer'] },
+      IsWindowVisible: { return: 'int32', arguments: ['pointer'] },
+      IsIconic: { return: 'int32', arguments: ['pointer'] },
+      GetWindowThreadProcessId: { return: 'uint32', arguments: ['pointer', 'buffer'] },
+      GetWindowRect: { return: 'int32', arguments: ['pointer', 'buffer'] },
+      GetWindowTextW: { return: 'int32', arguments: ['pointer', 'buffer', 'int32'] },
+      ShowWindow: { return: 'int32', arguments: ['pointer', 'int32'] },
+      SetForegroundWindow: { return: 'int32', arguments: ['pointer'] },
+      keybd_event: { return: 'void', arguments: ['uint8', 'uint8', 'uint32', 'uint64'] },
+      GetSystemMetrics: { return: 'int32', arguments: ['int32'] },
+      MessageBoxW: { return: 'int32', arguments: ['pointer', 'buffer', 'buffer', 'uint32'] },
+    }),
+  };
+  return windowsLibraries;
+}
+
+/** `text` as a NUL-terminated UTF-16 string, for the Windows functions whose name ends in W. */
+function wideString(text) {
+  // Buffer.alloc gives memory of its own (see callDpapi), and its last two zero bytes are the NUL.
+  const buffer = Buffer.alloc((text.length + 1) * 2);
+  buffer.write(text, 'utf16le');
+  return buffer;
+}
 
 /**
  * Encrypt or decrypt a Buffer for this Windows user, inside this process.
- * - `name`: CryptProtectData or CryptUnprotectData.
- * - Returns a Buffer, or null when this Node.js has no node:ffi (older than 26.1, only when running from source).
- * - Throws when Windows refuses, for example for data of another Windows user.
- * - Security software flags PowerShell that decrypts DPAPI data, because credential stealers do that.
+ * - `name`: CryptProtectData or CryptUnprotectData. Returns a Buffer.
+ * - Throws when this Node.js has no node:ffi (older than 26.1, only when running from source), and when Windows
+ *   refuses, for example for data of another Windows user.
+ * - Never through PowerShell: security software flags PowerShell that decrypts DPAPI data, because credential
+ *   stealers do that. A sign-in that Caliope 1.0.0 to 1.0.2 saved through PowerShell decrypts here too.
  */
-export async function callDpapi(name, input) {
-  const ffi = await import('node:ffi').catch(() => null);
-  if (!ffi) return null;
-  const crypt32 = ffi.dlopen('crypt32.dll', { [name]: DPAPI_SIGNATURE });
-  const kernel32 = ffi.dlopen('kernel32.dll', { LocalFree: { return: 'pointer', arguments: ['pointer'] } });
+export function callDpapi(name, input) {
+  if (!ffi) throw new Error('Remembering the sign-in needs Node.js 26.1 or newer, which comes with the Caliope download.');
+  const { crypt32, kernel32 } = windowsApi();
   // Buffer.alloc gives memory of its own: a small Buffer.from can share a pool, at an offset.
   const inputBytes = Buffer.alloc(input.length);
   input.copy(inputBytes);
@@ -155,72 +206,24 @@ export async function callDpapi(name, input) {
   inputBlob.writeBigUInt64LE(ffi.getRawPointer(inputBytes), 8);
   const outputBlob = Buffer.alloc(16);
   const succeeded = crypt32.functions[name](inputBlob, null, null, null, null, CRYPTPROTECT_UI_FORBIDDEN, outputBlob);
-  if (!succeeded) throw new Error(`${name} failed.`);
+  if (!succeeded) throw new Error(`${name} failed for this Windows user.`);
   const outputAddress = outputBlob.readBigUInt64LE(8);
-  const output = ffi.toBuffer(outputAddress, outputBlob.readUInt32LE(0));
+  // A copy of the bytes, because LocalFree gives Windows' memory back right after.
+  const output = ffi.toBuffer(outputAddress, outputBlob.readUInt32LE(0), true);
   kernel32.functions.LocalFree(outputAddress);
   return output;
 }
 
 export async function protectSecret(plainText) {
-  const encrypted = await callDpapi('CryptProtectData', Buffer.from(plainText, 'utf8'));
-  if (encrypted) {
-    const encryptedText = encrypted.toString('base64');
-    return encryptedText;
-  }
-  const script = [
-    'Add-Type -AssemblyName System.Security',
-    '$plain = [Console]::In.ReadToEnd()',
-    '$bytes = [System.Text.Encoding]::UTF8.GetBytes($plain)',
-    "$protected = [System.Security.Cryptography.ProtectedData]::Protect($bytes, $null, 'CurrentUser')",
-    '[Console]::Out.Write([Convert]::ToBase64String($protected))',
-  ].join('\n');
-  const protectedText = (await runPowerShell(script, { input: plainText })).trim();
-  return protectedText;
+  const encrypted = callDpapi('CryptProtectData', Buffer.from(plainText, 'utf8'));
+  const encryptedText = encrypted.toString('base64');
+  return encryptedText;
 }
 
 export async function unprotectSecret(protectedBase64) {
-  const decrypted = await callDpapi('CryptUnprotectData', Buffer.from(protectedBase64, 'base64'));
-  if (decrypted) {
-    const decryptedText = decrypted.toString('utf8');
-    return decryptedText;
-  }
-  const script = [
-    'Add-Type -AssemblyName System.Security',
-    '$encoded = [Console]::In.ReadToEnd().Trim()',
-    '$bytes = [Convert]::FromBase64String($encoded)',
-    "$plain = [System.Security.Cryptography.ProtectedData]::Unprotect($bytes, $null, 'CurrentUser')",
-    '[Console]::Out.Write([System.Text.Encoding]::UTF8.GetString($plain))',
-  ].join('\n');
-  const plainText = await runPowerShell(script, { input: protectedBase64 });
-  return plainText;
-}
-
-/**
- * Show the Windows folder picker and return the chosen folder, or null when cancelled.
- * - A hidden top-most owner form keeps the dialog in front of the app window.
- */
-export async function pickFolder(initialFolder) {
-  const script = [
-    'Add-Type -AssemblyName System.Windows.Forms',
-    '$initial = [Console]::In.ReadToEnd().Trim()',
-    '$dialog = New-Object System.Windows.Forms.FolderBrowserDialog',
-    "$dialog.Description = 'Choose the project folder for this session'",
-    '$dialog.ShowNewFolderButton = $true',
-    'if ($initial -and (Test-Path -LiteralPath $initial)) { $dialog.SelectedPath = $initial }',
-    '$owner = New-Object System.Windows.Forms.Form',
-    '$owner.TopMost = $true',
-    '$owner.ShowInTaskbar = $false',
-    "$owner.StartPosition = 'CenterScreen'",
-    '$owner.Size = New-Object System.Drawing.Size(1, 1)',
-    '$owner.Show()',
-    '$owner.Activate()',
-    '$result = $dialog.ShowDialog($owner)',
-    '$owner.Close()',
-    "if ($result -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($dialog.SelectedPath) }",
-  ].join('\n');
-  const output = (await runPowerShell(script, { input: initialFolder || '', sta: true, timeoutMs: 15 * 60 * 1000 })).trim();
-  return output || null;
+  const decrypted = callDpapi('CryptUnprotectData', Buffer.from(protectedBase64, 'base64'));
+  const decryptedText = decrypted.toString('utf8');
+  return decryptedText;
 }
 
 export function revealInExplorer(target) {
@@ -233,13 +236,13 @@ export function revealInExplorer(target) {
   // Explorer only understands /select,"path" with the quotes around the path, so pass it verbatim.
   const folder = fs.existsSync(target) ? target : path.dirname(target);
   const argument = isFile ? `/select,"${target}"` : `"${folder}"`;
-  const child = spawn('explorer.exe', [argument], { detached: true, stdio: 'ignore', windowsVerbatimArguments: true });
+  const child = spawn(path.join(WINDOWS_FOLDER, 'explorer.exe'), [argument], { detached: true, stdio: 'ignore', windowsVerbatimArguments: true });
   child.unref();
 }
 
 /** Open a file with its default Windows program (Explorer avoids cmd.exe quoting rules). */
 export function openWithDefaultApp(target) {
-  const child = spawn('explorer.exe', [target], { detached: true, stdio: 'ignore' });
+  const child = spawn(path.join(WINDOWS_FOLDER, 'explorer.exe'), [target], { detached: true, stdio: 'ignore' });
   child.unref();
 }
 
@@ -267,7 +270,7 @@ export function remoteDebuggingBlocked(name) {
     const key = name === 'edge' ? 'Microsoft\\Edge' : 'Google\\Chrome';
     for (const hive of ['HKLM', 'HKCU']) {
       try {
-        const output = execFileSync('reg.exe', ['query', `${hive}\\SOFTWARE\\Policies\\${key}`, '/v', 'RemoteDebuggingAllowed'], { encoding: 'utf8', windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'], timeout: 5000 });
+        const output = execFileSync(systemProgram('reg.exe'), ['query', `${hive}\\SOFTWARE\\Policies\\${key}`, '/v', 'RemoteDebuggingAllowed'], { encoding: 'utf8', windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'], timeout: 5000 });
         if (/RemoteDebuggingAllowed\s+REG_DWORD\s+0x0\s*$/im.test(output)) blocked = true;
       } catch {
         // The policy is not set.
@@ -329,12 +332,12 @@ export function openUrl(url, choice) {
     openWithSystemBrowser(url);
   }
   const processNames = browser ? path.basename(browser, '.exe') : 'chrome,msedge,firefox';
-  runPowerShell(FOCUS_BROWSER_SCRIPT, { input: processNames, timeoutMs: 20000 }).catch(() => {});
+  focusBrowser(processNames).catch(() => {});
 }
 
 // Windows keeps a window that a background program (this server) opens behind the active one. A pressed
 // and released Alt key first lets the browser come forward. The app window itself has no " - Google Chrome"
-// in its title, so it is never picked.
+// in its title, so it is never picked. The script is for a Node.js without node:ffi (see focusBrowser).
 export const FOCUS_BROWSER_SCRIPT = [
   "Add-Type -Namespace Caliope -Name Window -MemberDefinition @'",
   '[DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);',
@@ -357,8 +360,63 @@ export const FOCUS_BROWSER_SCRIPT = [
   '}',
 ].join('\n');
 
+// The end of a normal browser window's title, per browser program. Edge has a zero-width space in "Microsoft Edge".
+const BROWSER_TITLES = { chrome: / - Google Chrome$/, msedge: / - Microsoft.?Edge$/, firefox: / - Mozilla Firefox$/ };
+
+/** Bring the window of `processNames` (comma-separated) to the front once the browser shows it (see above). */
+async function focusBrowser(processNames) {
+  if (!ffi) {
+    await runPowerShell(FOCUS_BROWSER_SCRIPT, { input: processNames, timeoutMs: 20000 });
+    return;
+  }
+  const titleEnds = processNames.split(',').map((name) => BROWSER_TITLES[name]);
+  // A browser that was not running yet needs a moment for its window.
+  for (let tries = 0; tries < 12; tries++) {
+    await sleep(250);
+    const window = visibleWindows().find((candidate) => !candidate.outOfSight && titleEnds.some((titleEnd) => titleEnd.test(candidate.title)));
+    if (window) {
+      bringToFront(window.handle);
+      return;
+    }
+  }
+}
+
+/**
+ * The visible top-level windows, front first, as { handle, processId, title, outOfSight }.
+ * - `outOfSight`: left of every screen and not minimized, as the agent's browser windows that are out of sight.
+ */
+function visibleWindows() {
+  const user32 = windowsApi().user32.functions;
+  const screenLeft = user32.GetSystemMetrics(SM_XVIRTUALSCREEN);
+  const processId = Buffer.alloc(4);
+  const rect = Buffer.alloc(16);
+  const text = Buffer.alloc(1024);
+  const windows = [];
+  // Without a parent, FindWindowExW steps through the top-level windows in Z order. After the last one, it returns 0n.
+  for (let handle = user32.FindWindowExW(null, null, null, null); handle; handle = user32.FindWindowExW(null, handle, null, null)) {
+    if (!user32.IsWindowVisible(handle)) continue;
+    user32.GetWindowThreadProcessId(handle, processId);
+    // A RECT holds left, top, right and bottom as 32-bit numbers.
+    user32.GetWindowRect(handle, rect);
+    const length = user32.GetWindowTextW(handle, text, text.length / 2);
+    const outOfSight = rect.readInt32LE(8) <= screenLeft && !user32.IsIconic(handle);
+    windows.push({ handle, processId: processId.readUInt32LE(0), title: text.toString('utf16le', 0, length * 2), outOfSight });
+  }
+  return windows;
+}
+
+/** Bring window `handle` to the front, restored when it is minimized. Alt goes first: see FOCUS_BROWSER_SCRIPT. */
+function bringToFront(handle) {
+  const user32 = windowsApi().user32.functions;
+  if (user32.IsIconic(handle)) user32.ShowWindow(handle, 9);
+  // Alt (0x12) down, then up (flag 2), as an extended key (flag 1).
+  user32.keybd_event(0x12, 0, 1, 0);
+  user32.keybd_event(0x12, 0, 3, 0);
+  user32.SetForegroundWindow(handle);
+}
+
 // One window of a browser process, found by its title, on the screen: the agent's session windows that are out
-// of sight are left of every screen, so the one just moved onto it is picked.
+// of sight are left of every screen, so the one just moved onto it is picked. For a Node.js without node:ffi.
 const FOCUS_WINDOW_SCRIPT = [
   "Add-Type -TypeDefinition @'",
   'using System; using System.Text; using System.Runtime.InteropServices;',
@@ -396,18 +454,85 @@ const FOCUS_WINDOW_SCRIPT = [
 
 /** Bring the window of browser process `processId` whose title starts with `title` to the front (see FOCUS_WINDOW_SCRIPT). */
 export async function focusWindow(processId, title) {
-  await runPowerShell(FOCUS_WINDOW_SCRIPT, { input: `${processId}\n${String(title).slice(0, 60)}`, timeoutMs: 20000 });
+  const titleStart = String(title).slice(0, 60);
+  if (!ffi) {
+    await runPowerShell(FOCUS_WINDOW_SCRIPT, { input: `${processId}\n${titleStart}`, timeoutMs: 20000 });
+    return;
+  }
+  const window = visibleWindows().find((candidate) => candidate.processId === processId && !candidate.outOfSight && candidate.title.startsWith(titleStart));
+  if (window) bringToFront(window.handle);
+}
+
+/** The left edge of the leftmost screen in pixels: 0, or below 0 with a screen left of the main one. */
+export async function virtualScreenLeft() {
+  if (ffi) {
+    const left = windowsApi().user32.functions.GetSystemMetrics(SM_XVIRTUALSCREEN);
+    return left;
+  }
+  const output = await runPowerShell('Add-Type -AssemblyName System.Windows.Forms\n[System.Windows.Forms.SystemInformation]::VirtualScreen.Left', { timeoutMs: 20000 });
+  const left = Number(output.trim());
+  return left;
+}
+
+/**
+ * Show `message` in a Windows message box with an error icon, and wait until it is closed.
+ * - Through node:ffi, this whole process waits meanwhile: only for errors before Caliope exits.
+ */
+export async function showErrorBox(message) {
+  if (ffi) {
+    // MB_ICONERROR, MB_SETFOREGROUND and MB_TOPMOST: the server has no window that the box could open in front of.
+    windowsApi().user32.functions.MessageBoxW(null, wideString(message), wideString('Caliope'), 0x10 | 0x10000 | 0x40000);
+    return;
+  }
+  const script = [
+    'Add-Type -AssemblyName PresentationFramework',
+    '$text = [Console]::In.ReadToEnd()',
+    "[void][System.Windows.MessageBox]::Show($text, 'Caliope', 'OK', 'Error')",
+  ].join('\n');
+  await runPowerShell(script, { input: message, timeoutMs: 10 * 60 * 1000 });
+}
+
+/**
+ * Remove the "from the internet" mark (a Zone.Identifier stream) from every file in `folder`.
+ * - Files from a downloaded zip carry it, so Windows warns before every start of Caliope.cmd. Only while
+ *   Caliope.cmd has it, so normally nothing is done.
+ * - Caliope.cmd's mark goes last: when another file fails, the next start tries the rest again.
+ */
+export function removeDownloadMarks(folder) {
+  const launcher = path.join(folder, 'Caliope.cmd');
+  if (!fs.existsSync(`${launcher}:Zone.Identifier`)) return;
+  for (const entry of fs.readdirSync(folder, { recursive: true, withFileTypes: true })) {
+    const file = path.join(entry.parentPath, entry.name);
+    if (entry.isFile() && file !== launcher) fs.rmSync(`${file}:Zone.Identifier`, { force: true });
+  }
+  fs.rmSync(`${launcher}:Zone.Identifier`, { force: true });
+}
+
+/**
+ * Start Caliope at sign-in without a window, or stop doing so: a .cmd in the user's Startup folder that calls `launcher`.
+ * - No PowerShell and no registry. Task Manager lists it under Startup apps. The uninstall removes the installed copy's entry.
+ * - cmd.exe reads a .cmd file in the console's code page, not as UTF-8, so a user folder such as C:\Users\Zoë would
+ *   break the path. The installed launcher is written as %LOCALAPPDATA%\..., in plain ASCII. The entry of an unzipped
+ *   copy first switches the code page to UTF-8.
+ * - `enabled` false removes only this copy's entry: one that another copy of Caliope wrote stays.
+ */
+export function setStartAtSignIn(enabled, launcher) {
+  const entry = path.join(process.env.APPDATA, 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup', 'Caliope.cmd');
+  const installedLauncher = path.join(process.env.LOCALAPPDATA, 'Programs', 'Caliope', 'Caliope.cmd');
+  const content = launcher.toLowerCase() === installedLauncher.toLowerCase() ? '@call "%LOCALAPPDATA%\\Programs\\Caliope\\Caliope.cmd" --background\r\n' : `@chcp 65001>nul\r\n@call "${launcher}" --background\r\n`;
+  if (enabled) fs.writeFileSync(entry, content);
+  else if (fs.existsSync(entry) && fs.readFileSync(entry, 'utf8') === content) fs.rmSync(entry, { force: true });
 }
 
 function openWithSystemBrowser(url) {
-  const child = spawn('rundll32.exe', ['url.dll,FileProtocolHandler', url], { detached: true, stdio: 'ignore' });
+  const child = spawn(systemProgram('rundll32.exe'), ['url.dll,FileProtocolHandler', url], { detached: true, stdio: 'ignore' });
   child.unref();
 }
 
 export function killProcessTree(pid) {
   if (!pid) return;
   if (process.platform === 'win32') {
-    const killer = spawn('taskkill.exe', ['/PID', String(pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' });
+    const killer = spawn(systemProgram('taskkill.exe'), ['/PID', String(pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' });
     killer.on('error', () => {});
   } else {
     try {

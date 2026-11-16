@@ -1,7 +1,10 @@
 // HTTP client for the GitHub Copilot API: model list, request headers, retries.
 import crypto from 'node:crypto';
-import { readJson, writeJsonAtomic, sleep, isAbortError } from './util.js';
+import fsp from 'node:fs/promises';
+import path from 'node:path';
+import { readJson, writeJsonAtomic, sleep, isAbortError, KeyedQueue } from './util.js';
 import { AuthError, userAgent } from './auth.js';
+import { APP_VERSION } from './config.js';
 
 // Matches what GitHub's Copilot CLI sends when it calls the API with a GitHub token.
 const API_VERSION = '2025-05-01';
@@ -27,6 +30,13 @@ export class CopilotClient {
     this.models = [];
     this.modelsFetchedAt = null;
     this.modelsError = null;
+    // Optional request fields Copilot refused, per model (see streamModelRequest). `savedAdaptations` holds the
+    // fields Copilot does not take at all, which are also saved next to the model list.
+    this.adaptationsFile = path.join(path.dirname(cacheFile), 'model-adaptations.json');
+    this.adaptations = new Map();
+    this.savedAdaptations = {};
+    // Saves run one after another, so the file always ends with the latest fields.
+    this.queue = new KeyedQueue();
   }
 
   async loadCachedModels() {
@@ -35,6 +45,38 @@ export class CopilotClient {
       this.models = cached.models;
       this.modelsFetchedAt = cached.fetchedAt || null;
     }
+    // A new version starts without them, so a field Copilot accepts again gets another try.
+    const saved = await readJson(this.adaptationsFile, null).catch(() => null);
+    if (saved?.version === APP_VERSION && saved.models) {
+      this.savedAdaptations = saved.models;
+      this.adaptations = new Map(Object.entries(saved.models).map(([modelId, fields]) => [modelId, { ...fields }]));
+    }
+  }
+
+  /** The optional fields left out for a model, such as { noDisplay: true }. The same object on every call until clearAdaptations. */
+  adaptationsFor(modelId) {
+    let adaptations = this.adaptations.get(modelId);
+    if (!adaptations) {
+      adaptations = {};
+      this.adaptations.set(modelId, adaptations);
+    }
+    return adaptations;
+  }
+
+  /**
+   * Save a field Copilot does not take at all for a model, so the next start leaves it out too.
+   * - Each save writes the fields as they are when it starts, so two refusals close together both reach the file.
+   */
+  async saveAdaptation(modelId, change) {
+    this.savedAdaptations[modelId] = { ...this.savedAdaptations[modelId], [change]: true };
+    await this.queue.run(this.adaptationsFile, () => writeJsonAtomic(this.adaptationsFile, { version: APP_VERSION, models: this.savedAdaptations }));
+  }
+
+  /** Forget every refused field, the saved ones too, so each model tries them again (after the user refreshed the model list). */
+  async clearAdaptations() {
+    this.adaptations = new Map();
+    this.savedAdaptations = {};
+    await this.queue.run(this.adaptationsFile, () => fsp.rm(this.adaptationsFile, { force: true }));
   }
 
   /** Fetch and normalize the model list for the signed-in account. */
@@ -178,6 +220,42 @@ export async function toApiError(response, prefix) {
     retryable: RETRY_STATUSES.has(response.status),
   });
   return error;
+}
+
+/**
+ * The request fields a 400 names, as dotted paths in lower case ("include[0]" becomes "include.0").
+ * - The body's `param` (OpenAI), or the field path before a colon as Anthropic writes it
+ *   ("thinking.display: Extra inputs are not permitted").
+ * - Without either, the names the message quotes ("Unknown parameter: 'include'") and the word right before
+ *   "is not supported" ("adaptive thinking is not supported"). A plain word elsewhere in the text, such as
+ *   "must include", names nothing.
+ * - Copilot can pass on the upstream error as a JSON string in `message`. That error is read instead.
+ */
+export function fieldsNamedIn(error) {
+  let details = error.body?.error ?? error.body;
+  if (typeof details?.message === 'string' && details.message.trim().startsWith('{')) {
+    try {
+      const upstream = JSON.parse(details.message);
+      details = upstream?.error ?? upstream;
+    } catch {
+      // Not JSON after all: the message is read as text.
+    }
+  }
+  const message = typeof details?.message === 'string' ? details.message : String(error.message);
+  const location = (typeof details?.param === 'string' && details.param) || /(?:^|: )([a-z_][\w.[\]]*): /i.exec(message)?.[1];
+  const names = location ? [location] : [...message.matchAll(/['"`]([a-z_][\w.[\]]*)['"`]|\b([a-z_]\w*) (?:is|are) not supported\b/gi)].map((match) => match[1] || match[2]);
+  const paths = names.map((name) => name.toLowerCase().split(/[.[\]]+/).filter(Boolean).join('.'));
+  return paths;
+}
+
+/**
+ * True when a 400 names `field` (a dotted path), a field inside it, or its last part alone.
+ * - "thinking" also covers "thinking.type". "reasoning.summary" also covers a bare "summary".
+ */
+export function namesField(error, field) {
+  const lastPart = field.split('.').at(-1);
+  const named = fieldsNamedIn(error).some((name) => name === field || name.startsWith(`${field}.`) || name === lastPart);
+  return named;
 }
 
 /**

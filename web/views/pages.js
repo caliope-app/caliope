@@ -2,10 +2,10 @@
 import { h, clear, basename, relativeTime, copyText } from '../lib/dom.js';
 import { icon } from '../lib/icons.js';
 import { api } from '../lib/api.js';
-import { state, on, loadPreference, savePreference } from '../lib/store.js';
+import { state, on, modelById, loadPreference, savePreference } from '../lib/store.js';
 import * as actions from '../lib/actions.js';
-import { Composer } from './composer.js';
-import { openMenu, openModal, toast, toastError, confirmDialog } from './dialogs.js';
+import { Composer, MODES, showHelp } from './composer.js';
+import { openMenu, openModal, openFolderBrowser, promptDialog, toast, toastError, confirmDialog } from './dialogs.js';
 
 // ---------- New session ----------
 
@@ -13,7 +13,10 @@ export function mountNewSession(container) {
   const subscriptions = [];
   let folder = state.newSessionFolder || loadPreference('lastFolder', null) || state.settings?.recentFolders?.[0] || null;
   state.newSessionFolder = null;
-  let mode = state.settings?.defaultMode || 'auto';
+  let mode = state.settings?.defaultMode || 'edits';
+  // The model and effort picked here for the new session. null: the default for the mode, from Settings.
+  let model = null;
+  let effort = null;
   let creating = false;
   let useWorktree = false;
   let folderCommands = [];
@@ -39,31 +42,54 @@ export function mountNewSession(container) {
   );
   const recentElement = h('div', { class: 'recent-list' });
 
+  const setMode = (next) => {
+    mode = next;
+    composer.refresh();
+  };
   const composer = new Composer({
     placeholder: 'What should we work on? (Enter to start)',
     sessionId: () => null,
     mode: () => mode,
-    setMode: (next) => {
-      mode = next;
+    setMode,
+    model: () => model || (mode === 'plan' ? state.modelDefaults.plan : state.modelDefaults.build),
+    effort: () => effort || (mode === 'plan' ? state.settings?.planEffort : state.settings?.buildEffort),
+    setModel: (next) => {
+      model = next;
+      // Keep the effort only when the new model offers it.
+      if (!modelById(next)?.efforts?.includes(effort)) effort = null;
       composer.refresh();
     },
-    model: () => (mode === 'plan' ? state.modelDefaults.plan : state.modelDefaults.build),
-    effort: () => (mode === 'plan' ? state.settings?.planEffort : state.settings?.buildEffort),
-    setModel: () => toast('Pick the model after the session starts, or set the defaults in Settings → Models.'),
-    setEffort: () => toast('Set the default effort in Settings → Models, or change it once the session starts.'),
+    setEffort: (next) => {
+      effort = next;
+      composer.refresh();
+    },
     running: () => creating,
     queue: () => [],
     commands: () => folderCommands,
     skills: () => folderSkills,
     onSubmit: (text, images) => start(text, images),
     onStop: () => {},
-    onSlash: async (name) => {
-      if (name === 'settings') actions.showView('settings');
-      else if (name === 'usage') actions.showView('usage');
-      else toast('Start the session first, then use that command.');
-      return true;
-    },
+    onSlash: runSlash,
   });
+
+  /** / commands before the session exists: modes, model and effort apply to it; the agent's commands start it. */
+  async function runSlash(name, argument) {
+    const modes = { plan: 'plan', build: 'edits', ask: 'ask', auto: 'auto', full: 'full' };
+    if (modes[name]) {
+      setMode(modes[name]);
+      // A request that could not start goes back into the box.
+      if (name === 'plan' && argument && !(await start(argument, []))) composer.setText(`/plan ${argument}`);
+    } else if (name === 'model') composer.openModelMenu();
+    else if (name === 'effort') {
+      if (modelById(composer.controller.model())?.efforts?.includes(argument)) composer.controller.setEffort(argument);
+      else composer.openEffortMenu();
+    } else if (['review', 'init', 'commit', 'pr'].includes(name)) {
+      if (await startSession()) await actions.runCommand(name);
+    } else if (name === 'settings' || name === 'usage') actions.showView(name);
+    else if (name === 'help') showHelp();
+    else toast('Start the session first, then use that command.');
+    return true;
+  }
 
   const page = h(
     'div',
@@ -124,10 +150,10 @@ export function mountNewSession(container) {
     for (const meta of recent) {
       recentElement.append(
         h(
-          'div',
-          { class: 'session-item', role: 'button', tabindex: '0', onClick: () => actions.openSession(meta.id) },
+          'button',
+          { class: 'session-item', type: 'button', onClick: () => actions.openSession(meta.id) },
           h('span', { class: 'status', html: icon('message-square', 14) }),
-          h('div', { class: 'body' }, h('div', { class: 'title' }, meta.title), h('div', { class: 'sub' }, h('span', { class: 'ellipsis' }, meta.cwd), h('span', {}, '·'), h('span', {}, relativeTime(meta.updatedAt)))),
+          h('span', { class: 'body' }, h('span', { class: 'title' }, meta.title), h('span', { class: 'sub' }, h('span', { class: 'ellipsis' }, meta.cwd), h('span', {}, '·'), h('span', {}, relativeTime(meta.updatedAt)))),
         ),
       );
     }
@@ -140,13 +166,8 @@ export function mountNewSession(container) {
   }
 
   async function browse() {
-    try {
-      const result = await api.post('/api/pick-folder', { initial: folder || '' });
-      if (result.path) setFolder(result.path);
-    } catch (error) {
-      toastError(error);
-      openFolderBrowser();
-    }
+    const picked = await openFolderBrowser({ initial: folder || '' });
+    if (picked) setFolder(picked);
   }
 
   function openFolderMenu(anchor) {
@@ -155,62 +176,18 @@ export function mountNewSession(container) {
       recent.length ? { section: 'Recent folders' } : null,
       ...recent.map((item) => ({ label: item, icon: 'folder', checked: item === folder, onSelect: () => setFolder(item) })),
       recent.length ? 'separator' : null,
-      { label: 'Browse with Windows…', icon: 'folder-open', onSelect: browse },
-      { label: 'Browse in the app…', icon: 'folder-tree', onSelect: openFolderBrowser },
+      { label: 'Browse…', icon: 'folder-tree', onSelect: browse },
       { label: 'Type a path…', icon: 'pencil', onSelect: typePath },
     ]);
   }
 
   async function typePath() {
-    const { promptDialog } = await import('./dialogs.js');
     const value = await promptDialog({ title: 'Project folder', value: folder || '', placeholder: 'C:\\path\\to\\project', confirmLabel: 'Use folder' });
     if (value && value.trim()) setFolder(value.trim().replace(/^"|"$/g, ''));
   }
 
-  function openFolderBrowser() {
-    let current = folder;
-    const list = h('div', { class: 'folder-browser' });
-    const pathLabel = h('div', { class: 'mono faint', style: { fontSize: '12px', wordBreak: 'break-all' } });
-    async function load(target) {
-      try {
-        const result = await api.get(`/api/folders${target ? `?path=${encodeURIComponent(target)}` : ''}`);
-        current = result.path;
-        clear(list);
-        pathLabel.textContent = result.path || 'This PC';
-        if (!result.path) {
-          for (const drive of result.drives) list.append(menuRow('monitor', drive, () => load(drive)));
-          list.append(menuRow('user', result.home, () => load(result.home)));
-          for (const recent of result.recent) list.append(menuRow('history', recent, () => load(recent)));
-          return;
-        }
-        list.append(menuRow('arrow-up', '..', () => load(result.parent)));
-        for (const name of result.folders) list.append(menuRow('folder', name, () => load(`${result.path}\\${name}`)));
-      } catch (error) {
-        toastError(error);
-      }
-    }
-    openModal({
-      title: 'Choose a project folder',
-      body: h('div', { class: 'stack' }, pathLabel, list),
-      footer: (close) => [
-        h('button', { class: 'btn', onClick: () => close() }, 'Cancel'),
-        h(
-          'button',
-          {
-            class: 'btn primary',
-            onClick: () => {
-              if (current) setFolder(current);
-              close();
-            },
-          },
-          'Use this folder',
-        ),
-      ],
-    });
-    load(folder || '');
-  }
-
-  async function start(text, images) {
+  /** Start the session with the folder, mode, model and effort chosen here. False when it did not start; the reason is shown. */
+  async function startSession() {
     if (!folder) {
       toast('Choose a project folder first.', { kind: 'error' });
       openFolderMenu(folderButton);
@@ -228,8 +205,8 @@ export function mountNewSession(container) {
     creating = true;
     composer.refresh();
     try {
-      await actions.createSession({ cwd: folder, mode, worktree: useWorktree });
-      return await actions.sendMessage(text, images);
+      await actions.createSession({ cwd: folder, mode, worktree: useWorktree, model, effort });
+      return true;
     } catch (error) {
       toastError(error);
       return false;
@@ -238,12 +215,27 @@ export function mountNewSession(container) {
     }
   }
 
+  async function start(text, images) {
+    const sent = (await startSession()) && (await actions.sendMessage(text, images));
+    return sent;
+  }
+
   subscriptions.push(on('models', () => composer.refresh()));
   subscriptions.push(on('settings', () => composer.refresh()));
   subscriptions.push(on('sessions', renderRecent));
   renderFolder();
   renderRecent();
-  setTimeout(() => composer.focus(), 0);
+  // A new install asks once which mode sessions start in. Closing the question keeps the mode from Settings
+  // and asks again at the next start.
+  if (state.boot.firstRun) {
+    state.boot.firstRun = false;
+    chooseDefaultMode().then((chosen) => {
+      if (chosen) setMode(chosen);
+      composer.focus();
+    });
+  } else {
+    setTimeout(() => composer.focus(), 0);
+  }
 
   return {
     destroy() {
@@ -253,8 +245,27 @@ export function mountNewSession(container) {
   };
 }
 
-function menuRow(iconName, label, onClick) {
-  return h('button', { class: 'menu-item', type: 'button', onClick }, h('span', { html: icon(iconName, 15) }), h('span', { class: 'ellipsis grow' }, label));
+/** Ask which mode new sessions start in, with Accept edits chosen, and save the answer as the default. Resolves the mode, or null. */
+function chooseDefaultMode() {
+  const answer = new Promise((resolve) => {
+    const options = ['edits', 'ask', 'auto', 'plan', 'full'].map((id) => MODES.find((mode) => mode.id === id));
+    const radios = options.map((mode) => h('input', { type: 'radio', name: 'first-mode', value: mode.id, checked: mode.id === 'edits' }));
+    openModal({
+      title: 'How much should the agent do on its own?',
+      body: h(
+        'div',
+        { class: 'stack', role: 'radiogroup', 'aria-label': 'Mode for new sessions' },
+        h('p', { class: 'muted', style: { margin: 0 } }, 'New sessions start in this mode. You can switch a session with Shift+Tab, and change the default in Settings → Permissions.'),
+        options.map((mode, index) => h('label', { class: 'mode-choice' }, radios[index], h('span', {}, h('strong', {}, mode.name), h('span', { class: 'muted' }, ` ${mode.description}`)))),
+      ),
+      footer: (close) => h('button', { class: 'btn primary', type: 'button', onClick: () => close(radios.find((radio) => radio.checked).value) }, 'Use this mode'),
+      onClose: async (mode) => {
+        if (mode && (await actions.saveSettings({ defaultMode: mode }))) resolve(mode);
+        else resolve(null);
+      },
+    });
+  });
+  return answer;
 }
 
 // ---------- Sign-in ----------
@@ -263,7 +274,7 @@ export function mountSignIn(container) {
   const subscriptions = [];
   const errorElement = h('div');
   const deviceElement = h('div');
-  const tokenInput = h('input', { class: 'input mono', type: 'password', placeholder: 'github_pat_…', autocomplete: 'off', spellcheck: 'false' });
+  const tokenInput = h('input', { class: 'input mono', type: 'password', placeholder: 'github_pat_…', autocomplete: 'off', spellcheck: 'false', 'aria-label': 'Personal access token' });
   const rememberBox = h('input', { type: 'checkbox', checked: true });
   const connectButton = h('button', { class: 'btn primary', type: 'button', onClick: connectToken }, 'Connect');
   let codeCopied = false;

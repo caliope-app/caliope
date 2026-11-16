@@ -144,7 +144,7 @@ export async function scheduleFromAgent({ manager, session, input, ask, signal }
   manager.hub.broadcast({ type: 'projects' });
   const first = new Date(task.nextRunAt).toLocaleString('en-GB', { weekday: 'short', hour: '2-digit', minute: '2-digit' });
   const ending = task.every === 'minutes' ? ` Remove it with action "delete" once its goal is reached; it ends after ${MAX_LOOP_RUNS} runs or ${LOOP_DAYS} days at the latest.` : '';
-  const content = `Scheduled "${task.name}" (id ${task.id}): ${describeSchedule(task)}, ${where(task)}, first run ${first}. It runs while Caliope is open.${ending}`;
+  const content = `Scheduled "${task.name}" (id ${task.id}): ${describeSchedule(task)}, ${where(task)}, first run ${first}. It runs while Caliope runs: with "Keep running for scheduled tasks" in Settings, also after its window closes.${ending}`;
   return { content };
 }
 

@@ -2,15 +2,17 @@
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
-import { spawn } from 'node:child_process';
+import { spawn, execFile } from 'node:child_process';
 import { newId, stripAnsi, truncateMiddle, formatDuration } from '../util.js';
-import { killProcessTree } from '../windows.js';
+import { killProcessTree, POWERSHELL } from '../windows.js';
 import { resolvePath, displayPath } from './paths.js';
 import { ToolInputError } from './fs-tools.js';
 
 const MAX_RESULT_CHARS = 30000;
 const HEAD_KEEP = 200000;
 const TAIL_KEEP = 800000;
+// How long a command's output may stay open after the command ended or was stopped (see runShellCommand).
+const OUTPUT_GRACE_MS = 2000;
 
 // The script is kept in a temporary .ps1 file and run as a script block (see shellInvocation): PowerShell
 // then reports errors as plain text (with -EncodedCommand it writes them as CLIXML), `exit` passes the
@@ -46,13 +48,39 @@ export function commandEnvironment(extraPath) {
   return env;
 }
 
+let constrainedCheck = null;
+
+/**
+ * Whether Windows PowerShell runs in Constrained Language Mode on this PC (a company policy such as AppLocker).
+ * - Checked once per server start; later calls get the same answer.
+ * - In that mode PowerShell cannot run the script block that shellInvocation builds, so commands run in cmd.exe.
+ */
+export function powershellConstrained() {
+  constrainedCheck ??= new Promise((resolve) => {
+    const args = ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', '$ExecutionContext.SessionState.LanguageMode'];
+    execFile(POWERSHELL, args, { windowsHide: true, timeout: 20000 }, (error, stdout) => resolve(String(stdout).trim() === 'ConstrainedLanguage'));
+  });
+  return constrainedCheck;
+}
+
+/**
+ * The shell commands really run in for the chosen `shell` ('powershell' or 'cmd'): 'cmd' when chosen, and
+ * also when PowerShell is in Constrained Language Mode (see powershellConstrained).
+ */
+export async function effectiveShell(shell) {
+  const runsInCmd = shell === 'cmd' || (await powershellConstrained());
+  const used = runsInCmd ? 'cmd' : shell;
+  return used;
+}
+
 /**
  * The program, arguments and spawn options that run `command` in the chosen shell (PowerShell runs a temporary script).
+ * - cmd.exe also runs the commands when PowerShell is in Constrained Language Mode (see effectiveShell).
  * - `stdin`: true to keep standard input open for the caller.
  */
 async function shellInvocation({ command, cwd, shell, extraPath, tmpDir, stdin = false }) {
   const spawnOptions = { cwd, env: commandEnvironment(extraPath), windowsHide: true, stdio: [stdin ? 'pipe' : 'ignore', 'pipe', 'pipe'] };
-  if (shell === 'cmd') {
+  if ((await effectiveShell(shell)) === 'cmd') {
     spawnOptions.windowsVerbatimArguments = true;
     const invocation = { exe: process.env.ComSpec || 'cmd.exe', args: ['/d', '/s', '/c', `"chcp 65001 >nul & ${command}"`], spawnOptions, scriptFile: null };
     return invocation;
@@ -61,7 +89,7 @@ async function shellInvocation({ command, cwd, shell, extraPath, tmpDir, stdin =
   const scriptFile = path.join(tmpDir, `c-${newId()}.ps1`);
   await fsp.writeFile(scriptFile, `﻿${POWERSHELL_PRELUDE}${command}${POWERSHELL_EPILOGUE}`, 'utf8');
   const runScript = `& ([scriptblock]::Create([IO.File]::ReadAllText(${psQuote(scriptFile)})))`;
-  const invocation = { exe: 'powershell.exe', args: ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', runScript], spawnOptions, scriptFile };
+  const invocation = { exe: POWERSHELL, args: ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', runScript], spawnOptions, scriptFile };
   return invocation;
 }
 
@@ -109,6 +137,7 @@ export async function runShellCommand({ command, cwd, shell, timeoutMs, extraPat
     }
     let timedOut = false;
     let interrupted = false;
+    let graceTimer = null;
     const stdoutDecoder = new TextDecoder('utf-8');
     const stderrDecoder = new TextDecoder('utf-8');
     child.stdout.on('data', (chunk) => append(stdoutDecoder.decode(chunk, { stream: true })));
@@ -118,27 +147,43 @@ export async function runShellCommand({ command, cwd, shell, timeoutMs, extraPat
       child.stdin.on('error', () => {});
       child.stdin.end(input);
     }
+    const finish = (outcome) => {
+      clearTimeout(timer);
+      clearTimeout(graceTimer);
+      signal?.removeEventListener('abort', onAbort);
+      append(stdoutDecoder.decode());
+      append(stderrDecoder.decode());
+      resolve(outcome);
+    };
+    // A program the command started can keep its output open after the command itself ended (cmd's `start /b`),
+    // and taskkill /T misses that program once its parent is gone. So after the command ends or is stopped,
+    // Caliope waits a moment for the output to close, then stops reading it. That program keeps running.
+    const stopReading = () => {
+      clearTimeout(graceTimer);
+      graceTimer = setTimeout(() => {
+        child.stdout.destroy();
+        child.stderr.destroy();
+        finish({ exitCode: child.exitCode, timedOut, interrupted });
+      }, OUTPUT_GRACE_MS);
+    };
     const timer = setTimeout(() => {
       timedOut = true;
       killProcessTree(child.pid);
+      stopReading();
     }, timeoutMs);
     const onAbort = () => {
       interrupted = true;
       killProcessTree(child.pid);
+      stopReading();
     };
     signal?.addEventListener('abort', onAbort, { once: true });
-    child.on('error', (error) => {
+    child.on('error', (error) => finish({ spawnError: error }));
+    // The command ended, so its time limit no longer applies.
+    child.on('exit', () => {
       clearTimeout(timer);
-      signal?.removeEventListener('abort', onAbort);
-      resolve({ spawnError: error });
+      stopReading();
     });
-    child.on('close', (code) => {
-      clearTimeout(timer);
-      signal?.removeEventListener('abort', onAbort);
-      append(stdoutDecoder.decode());
-      append(stderrDecoder.decode());
-      resolve({ exitCode: code, timedOut, interrupted });
-    });
+    child.on('close', (code) => finish({ exitCode: code, timedOut, interrupted }));
   });
   if (scriptFile) fs.rm(scriptFile, { force: true }, () => {});
   if (result.spawnError) throw new ToolInputError(`Could not start ${exe}: ${result.spawnError.message}`);
@@ -165,7 +210,7 @@ const JOB_FIRST_WAIT_MS = 3000;
 
 /**
  * Start a command that keeps running (a dev server, a watcher) and keep its output in memory.
- * - Returns the job. Read new output with readJobOutput, stop it with killProcessTree(job.pid).
+ * - Returns the job. Read new output with readJobOutput, stop it with stopJob.
  * - `onExit` runs once the process has ended.
  */
 export async function startBackgroundJob({ command, cwd, shell, extraPath, tmpDir, onExit }) {
@@ -195,6 +240,20 @@ export async function startBackgroundJob({ command, cwd, shell, extraPath, tmpDi
   child.on('error', (error) => finish(null, error));
   child.on('close', (code) => finish(code));
   return job;
+}
+
+/**
+ * Stop a background job.
+ * - As in runShellCommand: a program the job started can keep its output open after taskkill ended the job, so
+ *   Caliope stops reading after a moment. The job then ends. That program keeps running.
+ */
+export function stopJob(job) {
+  killProcessTree(job.pid);
+  setTimeout(() => {
+    if (!job.running) return;
+    job.child.stdout.destroy();
+    job.child.stderr.destroy();
+  }, OUTPUT_GRACE_MS);
 }
 
 /** Wait until the job ends, `ms` pass, or the turn is stopped. */
@@ -270,7 +329,7 @@ export const runCommandTool = {
       await waitForJob(job, JOB_FIRST_WAIT_MS, ctx.signal);
       const output = readJobOutput(job);
       const isError = !job.running && job.exitCode !== 0;
-      return { content: `${jobStatus(job)}\n${output}`, isError, meta: { background: true, job: job.id, running: job.running, exitCode: job.exitCode, cwd: displayPath(ctx.cwd, cwd), output } };
+      return { content: `${jobStatus(job)}\n${output}`, isError, meta: { background: true, job: job.id, running: job.running, exitCode: job.exitCode, cwd: displayPath(ctx.cwd, cwd) } };
     }
     const defaultTimeout = ctx.settings.commandTimeoutSec;
     const timeoutSec = Math.min(600, Math.max(1, Number.isInteger(input.timeout_sec) ? input.timeout_sec : defaultTimeout));
@@ -293,11 +352,11 @@ export const runCommandTool = {
     const output = result.output.trim() ? truncateMiddle(result.output.trimEnd(), MAX_RESULT_CHARS) : '(no output)';
     const content = `${status}\n${output}`;
     const isError = result.timedOut || result.interrupted || result.exitCode !== 0;
+    // The window shows the output from `content`, below its status line: the same text the model gets.
     return {
       content,
       isError,
-      // The window shows the same 30,000 characters the model gets. More would only grow session.json.
-      meta: { exitCode: result.exitCode, timedOut: result.timedOut, interrupted: result.interrupted, durationMs: result.durationMs, cwd: displayPath(ctx.cwd, cwd), output: truncateMiddle(result.output, MAX_RESULT_CHARS) },
+      meta: { exitCode: result.exitCode, timedOut: result.timedOut, interrupted: result.interrupted, durationMs: result.durationMs, cwd: displayPath(ctx.cwd, cwd) },
     };
   },
 };
@@ -321,13 +380,13 @@ export const commandOutputTool = {
     const job = ctx.jobs.get(input.job);
     if (!job) throw new ToolInputError(`This session has no background job "${input.job}".`);
     if (input.stop && job.running) {
-      killProcessTree(job.pid);
+      stopJob(job);
       await waitForJob(job, 5000, ctx.signal);
     } else if (input.wait_sec > 0) {
       await waitForJob(job, Math.min(60, input.wait_sec) * 1000, ctx.signal);
     }
     const output = readJobOutput(job);
-    return { content: `${jobStatus(job)}\n${output}`, meta: { job: job.id, running: job.running, exitCode: job.exitCode, output } };
+    return { content: `${jobStatus(job)}\n${output}`, meta: { job: job.id, running: job.running, exitCode: job.exitCode } };
   },
 };
 
@@ -349,7 +408,10 @@ export function splitCommandParts(command) {
 }
 
 /**
- * True when every part of the command starts with an allowed prefix.
+ * True when every part of the command matches an allow rule.
+ * - A rule allows its own command and that command with more words, so "git log" allows "git log -5".
+ * - A rule whose program prints files ("type notes.txt") allows only that exact command: more words could name more
+ *   files. Only the program counts (see commandProgram), so "git diff HEAD" is an ordinary rule.
  * - Allow rules are a convenience for repeated commands, not a sandbox: they compare text.
  */
 export function commandAllowed(command, prefixes) {
@@ -357,19 +419,58 @@ export function commandAllowed(command, prefixes) {
   const parts = splitCommandParts(command);
   if (!parts || parts.length === 0) return false;
   const normalizedPrefixes = prefixes.map((prefix) => prefix.trim().toLowerCase()).filter(Boolean);
+  const exactRules = new Set(normalizedPrefixes.filter((prefix) => FILE_READERS.test(commandProgram(prefix.split(/\s+/)).name)));
   const allowed = parts.every((part) => {
     const lower = part.toLowerCase();
-    return normalizedPrefixes.some((prefix) => lower === prefix || lower.startsWith(`${prefix} `));
+    return normalizedPrefixes.some((prefix) => lower === prefix || (!exactRules.has(prefix) && lower.startsWith(`${prefix} `)));
   });
   return allowed;
 }
 
+// Programs that print files: "Get-Content" alone as a rule would read any file, also Caliope's own.
+const FILE_READERS = /^(get-content|gc|type|cat|more|less|head|tail|select-string|sls|findstr|format-hex)$/;
+// Programs that delete files, folders or disks.
+const DELETERS = /^(remove-item|ri|rm|rmdir|rd|del|erase|rimraf|clear-content|clc|format|format-volume|clear-disk|diskpart)$/;
+// Interpreters and launchers: what they run comes after their options.
+const LAUNCHERS = /^(python\d*|py|node|npx|uv|uvx|deno|bun|cmd|powershell|pwsh|bash|sh|wsl|java|ruby|perl|php)(\.exe)?$/i;
+
 /**
- * Suggested allow rule for a command.
+ * The program a command runs, for the reader and delete checks.
+ * - `words`: the command split at spaces. Returns { at, name }: the program's index in `words`, and its name.
+ * - The name is the file name in lower case, without quotes, .exe or .com: C:\Windows\System32\findstr.exe is findstr.
+ * - After a launcher (cmd /c, powershell -Command, npx…) it is the program the launcher runs, so cmd /c "del x.txt"
+ *   runs del. Later words, such as a filter after a pipe, never count.
+ */
+function commandProgram(words) {
+  const nameOf = (word) => path.win32.basename(word.replace(/["']/g, '')).toLowerCase().replace(/\.(exe|com)$/, '');
+  const launched = LAUNCHERS.test(nameOf(words[0])) ? words.findIndex((word, index) => index > 0 && !/^[-/]/.test(word)) : -1;
+  const at = launched === -1 ? 0 : launched;
+  const program = { at, name: nameOf(words[at]) };
+  return program;
+}
+
+/**
+ * True when `rule` runs a program that prints files but names no file, such as "Get-Content -Raw".
+ * - commandAllowed matches such a rule only as that exact command, so it never lets a file be read.
+ */
+export function readerWithoutFile(rule) {
+  const words = rule.trim().split(/\s+/);
+  const { at, name } = commandProgram(words);
+  const withoutFile = FILE_READERS.test(name) && !words.slice(at + 1).some((word) => !/^[-/]/.test(word));
+  return withoutFile;
+}
+
+/**
+ * Suggested allow rule for a command, or null when it should get none.
  * - git, npm and similar: the program and its subcommand, like "git status".
  * - Interpreters and launchers (python, node, npx, cmd…): up to the script or module they run, like
  *   "python -m pytest", because "python" alone would allow any code.
- * - Anything else: the program, like "Get-Content".
+ * - Programs that print files (Get-Content, type, cat…): the whole command, like "Get-Content README.md",
+ *   because the program alone would allow reading any file. commandAllowed matches such a rule exactly. null
+ *   when it names no file.
+ * - Deletes (Remove-Item, rm, del…, also by path or after cmd /c), and the git subcommands reset, clean, rm and
+ *   force pushes: null, so the next one asks again. npm rm removes a package, not files, so it gets a rule.
+ * - Anything else: the program, like "dir".
  */
 export function suggestPrefix(command) {
   const parts = splitCommandParts(command);
@@ -378,15 +479,24 @@ export function suggestPrefix(command) {
   if (words.length === 0) return '';
   const program = words[0];
   const second = words[1];
-  if (/^(python\d*|py|node|npx|uv|uvx|deno|bun|cmd|powershell|pwsh|bash|sh|wsl|java|ruby|perl|php)(\.exe)?$/i.test(program)) {
+  let prefix = program;
+  if (LAUNCHERS.test(program)) {
     const firstNonOption = words.findIndex((word, index) => index > 0 && !/^[-/]/.test(word));
-    const prefix = (firstNonOption === -1 ? words : words.slice(0, firstNonOption + 1)).join(' ');
-    return prefix;
-  }
-  if (/^(git|npm|pnpm|yarn|dotnet|cargo|go|pip\d*|docker|kubectl|az|gh)(\.exe)?$/i.test(program)) {
+    prefix = (firstNonOption === -1 ? words : words.slice(0, firstNonOption + 1)).join(' ');
+  } else if (/^(git|npm|pnpm|yarn|dotnet|cargo|go|pip\d*|docker|kubectl|az|gh)(\.exe)?$/i.test(program)) {
     // An option before the subcommand (git -C dir status) is too specific to generalize.
-    if (second?.startsWith('-')) return first;
-    return second ? `${program} ${second}` : program;
+    if (second?.startsWith('-')) prefix = first;
+    else if (second) prefix = `${program} ${second}`;
   }
-  return program;
+  // "git reset" as a rule would also allow git reset --hard. The subcommand is the first word that is no option and
+  // not the folder or setting after -C or -c, so git -C sub reset --hard counts too, and git commit -m "clean up" not.
+  const subcommand = /^git(\.exe)?$/i.test(program) ? words.find((word, index) => index > 0 && !word.startsWith('-') && !/^-[Cc]$/.test(words[index - 1]))?.toLowerCase() : null;
+  const forcePush = subcommand === 'push' && words.some((word) => /^(-f|--force.*|\+.+)$/i.test(word));
+  const { name } = commandProgram(words);
+  if (DELETERS.test(name) || ['reset', 'clean', 'rm'].includes(subcommand) || forcePush) return null;
+  if (FILE_READERS.test(name)) {
+    const fileRule = readerWithoutFile(first) ? null : first;
+    return fileRule;
+  }
+  return prefix;
 }

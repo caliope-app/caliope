@@ -4,7 +4,7 @@ import { readFileTool, listDirTool, globTool, grepTool, editFileTool, writeFileT
 import { runCommandTool, commandOutputTool } from './shell.js';
 import { webFetchTool, webSearchTool } from './web.js';
 import { browserTool } from './browser.js';
-import { listPullRequestsTool, createPullRequestTool, mergePullRequestTool } from './pull-request.js';
+import { listPullRequestsTool, readPullRequestTool, createPullRequestTool, mergePullRequestTool } from './pull-request.js';
 
 // Tools whose work happens in the agent loop (they talk to the user or another model).
 export const todoWriteTool = {
@@ -108,7 +108,7 @@ export const scheduleTool = {
   name: 'schedule',
   kind: 'meta',
   description:
-    'Do something later or repeatedly, while Caliope is open. Use it when the user asks for a reminder, a recurring task or a loop ' +
+    'Do something later or repeatedly, while Caliope runs. Use it when the user asks for a reminder, a recurring task or a loop ' +
     '("check the build every 10 minutes until it is green"), and instead of waiting yourself for something slow, such as a pipeline, a deploy or a review. ' +
     'A reminder or loop comes back to this session as a message marked as your scheduled task, so you keep the context; a recurring task (hourly, daily, weekdays, weekly) starts a new session each time. ' +
     'End a loop with action "delete" as soon as its goal is reached (it stops by itself after 100 runs or 7 days). In Ask permissions and Accept edits mode the user approves each new task.',
@@ -177,6 +177,7 @@ const ALL_TOOLS = [
   runCommandTool,
   commandOutputTool,
   listPullRequestsTool,
+  readPullRequestTool,
   createPullRequestTool,
   mergePullRequestTool,
   webFetchTool,

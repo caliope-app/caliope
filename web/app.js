@@ -45,7 +45,8 @@ async function boot() {
   installLinkHandling();
   state.sidebar.group = loadPreference('sidebarGroup', 'project');
   applySidebarWidth(loadPreference('sidebarWidth', 288));
-  if (loadPreference('sidebarCollapsed', false)) app.classList.add('sidebar-collapsed');
+  applyNarrowWindow();
+  narrowWindow.addEventListener('change', applyNarrowWindow);
   try {
     await loadState();
   } catch (error) {
@@ -56,11 +57,18 @@ async function boot() {
   connect();
   on('save_errors', renderSaveBanner);
   on('shutdown', showShutdown);
-  on('view', renderMain);
+  on('view', () => {
+    renderMain();
+    // In a narrow window the sidebar opened over the page; choosing a session or page closes it.
+    if (narrowWindow.matches) app.classList.add('sidebar-collapsed');
+  });
   on('auth', () => {
     if (!state.auth?.signedIn && state.view === 'new') renderMain();
   });
   on('sidebar:toggle', toggleSidebar);
+  main.addEventListener('mousedown', () => {
+    if (narrowWindow.matches) app.classList.add('sidebar-collapsed');
+  });
   installResizer();
   installShortcuts();
   if (!state.auth?.signedIn) state.view = 'signin';
@@ -76,7 +84,7 @@ async function boot() {
 
 async function loadState() {
   const boot = await api.get('/api/state');
-  state.boot = { version: boot.version, user: boot.user, home: boot.home, dataDir: boot.dataDir, efforts: boot.efforts, extraPathDetected: boot.extraPathDetected };
+  state.boot = { version: boot.version, user: boot.user, home: boot.home, dataDir: boot.dataDir, efforts: boot.efforts, extraPathDetected: boot.extraPathDetected, firstRun: boot.firstRun };
   state.auth = boot.auth;
   state.settings = boot.settings;
   state.sessions = new Map(boot.sessions.map((meta) => [meta.id, meta]));
@@ -189,9 +197,35 @@ function installResizer() {
   resizer.addEventListener('dblclick', () => savePreference('sidebarWidth', applySidebarWidth(288)));
 }
 
+/**
+ * Below 820 pixels the sidebar is the rail of icons, and opening it lays it over the page. The choice saved for
+ * wide windows comes back when the window is wide again.
+ */
+const narrowWindow = window.matchMedia('(max-width: 820px)');
+// What had the focus when the sidebar opened over the page, such as a rail button: it gets the focus back.
+let focusBeforeSidebar = null;
+
+function applyNarrowWindow() {
+  app.classList.toggle('sidebar-collapsed', narrowWindow.matches || loadPreference('sidebarCollapsed', false));
+}
+
+/**
+ * Show or hide the sidebar.
+ * - In a narrow window it opens over the page with the focus in its search box. Closed again (Ctrl+B, Esc or
+ *   its hide button), it gives the focus back to what had it before.
+ */
 function toggleSidebar() {
-  app.classList.toggle('sidebar-collapsed');
-  savePreference('sidebarCollapsed', app.classList.contains('sidebar-collapsed'));
+  const collapsed = app.classList.toggle('sidebar-collapsed');
+  if (!narrowWindow.matches) {
+    savePreference('sidebarCollapsed', collapsed);
+    return;
+  }
+  if (!collapsed) {
+    focusBeforeSidebar = document.activeElement;
+    emit('sidebar:search');
+  } else {
+    focusBeforeSidebar?.focus();
+  }
 }
 
 // ---------- Shortcuts ----------
@@ -214,6 +248,14 @@ function installShortcuts() {
       event.preventDefault();
       actions.showView('settings');
     }
+  });
+  // Esc closes the sidebar that lies over the page in a narrow window. This listener comes before the session
+  // view's, so that Esc does not also stop the agent.
+  document.addEventListener('keydown', (event) => {
+    if (event.key !== 'Escape' || !narrowWindow.matches || app.classList.contains('sidebar-collapsed')) return;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    toggleSidebar();
   });
   // Keep the window title useful in the taskbar: how many sessions need you.
   on('runtime', updateTitle);

@@ -304,8 +304,12 @@ export const grepTool = {
     const context = Math.min(10, Math.max(0, Number.isInteger(input.context_lines) ? input.context_lines : 0));
     const maxResults = Math.min(2000, Math.max(1, Number.isInteger(input.max_results) ? input.max_results : 200));
 
+    // Files are taken in order, so once more than `maxResults` matches (content) or files are found, the
+    // files not started yet cannot be shown and are skipped. After a timeout the others are skipped too.
+    let found = 0;
+    let stopped = false;
     const perFile = await mapLimit(candidates, 16, async (absolutePath) => {
-      if (ctx.signal?.aborted) return null;
+      if (ctx.signal?.aborted || stopped) return null;
       let buffer;
       try {
         const fileStat = await fsp.stat(absolutePath);
@@ -319,14 +323,26 @@ export const grepTool = {
       matcher.lines = lines;
       let hits;
       try {
-        hits = MATCH_LINES.runInContext(matcher, { timeout: 3000 });
+        hits = [...MATCH_LINES.runInContext(matcher, { timeout: 3000 })];
       } catch (error) {
+        stopped = true;
         if (error.code === 'ERR_SCRIPT_EXECUTION_TIMEOUT') {
           throw new ToolInputError(`The regular expression took more than 3 seconds on ${displayPath(ctx.cwd, absolutePath)}. Use a simpler pattern (avoid nested repeats like (a+)+).`);
         }
         throw error;
       }
-      return hits.length ? { absolutePath, lines, hits: [...hits] } : null;
+      if (hits.length === 0) return null;
+      found += mode === 'content' ? hits.length : 1;
+      if (found > maxResults) stopped = true;
+      // Only the lines the output can show are kept: at most `maxResults` hits, each with its context.
+      const shownLines = new Map();
+      if (mode === 'content') {
+        for (const hit of hits.slice(0, maxResults)) {
+          for (let i = Math.max(0, hit - context); i <= Math.min(lines.length - 1, hit + context); i++) shownLines.set(i, clip(lines[i], 300));
+        }
+      }
+      const result = { absolutePath, hits, shownLines, lineCount: lines.length };
+      return result;
     });
     const results = perFile.filter(Boolean);
     const totalMatches = results.reduce((sum, result) => sum + result.hits.length, 0);
@@ -336,14 +352,15 @@ export const grepTool = {
 
     const output = [];
     let shownCount = 0;
+    // The search can stop early, so the notes below give no total.
     if (mode === 'files') {
       for (const result of results.slice(0, maxResults)) output.push(displayPath(ctx.cwd, result.absolutePath));
       shownCount = Math.min(results.length, maxResults);
-      if (results.length > maxResults) output.push(`(${results.length} files match; showing ${maxResults}.)`);
+      if (results.length > maxResults) output.push(`(More than ${maxResults} files match; showing the first ${maxResults}.)`);
     } else if (mode === 'count') {
       for (const result of results.slice(0, maxResults)) output.push(`${displayPath(ctx.cwd, result.absolutePath)}:${result.hits.length}`);
       shownCount = Math.min(results.length, maxResults);
-      if (results.length > maxResults) output.push(`(${results.length} files match; showing ${maxResults}.)`);
+      if (results.length > maxResults) output.push(`(More than ${maxResults} files match; showing the first ${maxResults}.)`);
     } else {
       outer: for (const result of results) {
         const shownPath = displayPath(ctx.cwd, result.absolutePath);
@@ -352,22 +369,23 @@ export const grepTool = {
         for (const hit of result.hits) {
           if (shownCount >= maxResults) break outer;
           const from = Math.max(0, hit - context);
-          const to = Math.min(result.lines.length - 1, hit + context);
+          const to = Math.min(result.lineCount - 1, hit + context);
           if (context > 0 && lastPrinted >= 0 && from > lastPrinted + 1) output.push('--');
           for (let i = from; i <= to; i++) {
             if (printed.has(i)) continue;
             printed.add(i);
             const separator = i === hit || result.hits.includes(i) ? ':' : '-';
-            output.push(`${shownPath}${separator}${i + 1}${separator}${clip(result.lines[i], 300)}`);
+            output.push(`${shownPath}${separator}${i + 1}${separator}${result.shownLines.get(i)}`);
             lastPrinted = i;
           }
           shownCount++;
         }
       }
-      if (totalMatches > shownCount) output.push(`(${totalMatches} matches in ${results.length} files; showing the first ${shownCount}. Narrow the search or raise max_results.)`);
+      if (totalMatches > shownCount) output.push(`(More than ${shownCount} matches; showing the first ${shownCount}. Narrow the search or raise max_results.)`);
     }
     if (truncatedListing) output.push('(The folder has more than 100,000 files; only the first 100,000 were searched.)');
-    return { content: output.join('\n'), meta: { matches: totalMatches, files: results.length } };
+    // `more`: the search stopped early, so the counts are what it found until then.
+    return { content: output.join('\n'), meta: { matches: totalMatches, files: results.length, more: stopped } };
   },
 };
 

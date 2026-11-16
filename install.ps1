@@ -3,8 +3,10 @@
 # - Each version goes into its own folder under %LOCALAPPDATA%\Programs\Caliope; the newest two are kept.
 # - %LOCALAPPDATA%\Programs\Caliope\Caliope.cmd starts the installed version; the Start-menu shortcut uses it.
 # - Sessions, settings and the sign-in stay in %LOCALAPPDATA%\Caliope.
-# - Run it again to update. Uninstall from Settings > Apps, or run this script with -Uninstall.
-# - Downloads go through HTTPS_PROXY when it is set (Caliope sets it from Settings > Network for updates).
+# - Caliope updates itself inside the app (server/updates.js), into the same layout. This script stays the first
+#   install, and the way Caliope 1.0.4 and older update. Running it again also updates.
+# - Uninstall from Settings > Apps, or run this script with -Uninstall.
+# - Downloads go through HTTPS_PROXY when it is set (Caliope 1.0.4 and older set it from Settings > Network for updates).
 # - -NoStart installs without starting Caliope (the release workflow tests the installer that way).
 # tools/package.mjs fills in the releases address; set CALIOPE_RELEASES_URL to use another one.
 param(
@@ -26,7 +28,7 @@ param(
   }
 
   if ($ExecutionContext.SessionState.LanguageMode -ne 'FullLanguage') {
-    Stop-Install 'PowerShell is restricted on this PC (Constrained Language Mode). Caliope uses PowerShell to save its sign-in, pick folders and run the agent''s commands, so it cannot work here. Ask your IT department.'
+    Stop-Install 'PowerShell is restricted on this PC (Constrained Language Mode), so this installer cannot run. Download the zip from the release page instead: Caliope then runs the agent''s commands in cmd.exe.'
   }
   if (-not [Environment]::Is64BitOperatingSystem) {
     Stop-Install 'Caliope needs 64-bit Windows.'
@@ -64,6 +66,16 @@ param(
     if (Test-Path -LiteralPath $DesktopShortcut) {
       $DesktopTarget = (New-Object -ComObject WScript.Shell).CreateShortcut($DesktopShortcut).TargetPath
       if ($DesktopTarget.StartsWith($Root, [StringComparison]::OrdinalIgnoreCase)) { Remove-Item -LiteralPath $DesktopShortcut -Force -ErrorAction SilentlyContinue }
+    }
+    # The Startup entry of "Keep running for scheduled tasks" starts the removed launcher; one for an unzipped copy stays.
+    # Caliope writes the installed launcher as %LOCALAPPDATA%\Programs\Caliope\Caliope.cmd, and other paths in UTF-8
+    # (setStartAtSignIn in server\windows.js), so the entry is read as UTF-8 and checked for both spellings.
+    $StartupEntry = Join-Path ([Environment]::GetFolderPath('Startup')) 'Caliope.cmd'
+    if (Test-Path -LiteralPath $StartupEntry) {
+      $StartupText = [System.IO.File]::ReadAllText($StartupEntry, [System.Text.Encoding]::UTF8)
+      if ($StartupText.IndexOf('%LOCALAPPDATA%\Programs\Caliope\', [StringComparison]::OrdinalIgnoreCase) -ge 0 -or $StartupText.IndexOf("$Root\", [StringComparison]::OrdinalIgnoreCase) -ge 0) {
+        Remove-Item -LiteralPath $StartupEntry -Force -ErrorAction SilentlyContinue
+      }
     }
     Remove-Item -LiteralPath $UninstallKey -Recurse -Force -ErrorAction SilentlyContinue
     Write-Host "Caliope is uninstalled. Your sessions and settings are still in $env:LOCALAPPDATA\Caliope; delete that folder to remove them too."
@@ -113,10 +125,14 @@ param(
     Remove-Item -LiteralPath $Zip -Force
   }
 
-  # The launcher, icon, shortcut and uninstall entry stay in place across updates; only the version changes.
+  # The launcher, icon, uninstaller, shortcut and uninstall entry stay in place across updates; only the version
+  # changes. The in-app update (server/updates.js) writes the same files.
   Set-Content -LiteralPath "$Launcher.tmp" -Value "@call `"%~dp0$Current\Caliope.cmd`" %*" -Encoding Ascii
   Move-Item -LiteralPath "$Launcher.tmp" -Destination $Launcher -Force
   Copy-Item -LiteralPath (Join-Path $Target 'assets\Caliope.ico') -Destination (Join-Path $Root 'Caliope.ico') -Force
+  # The uninstall runs this copy, so it keeps working after an update removes the version folder it came from.
+  $Uninstaller = Join-Path $Root 'install.ps1'
+  Copy-Item -LiteralPath (Join-Path $Target 'install.ps1') -Destination $Uninstaller -Force
 
   $Shell = New-Object -ComObject WScript.Shell
   $Link = $Shell.CreateShortcut($Shortcut)
@@ -130,7 +146,7 @@ param(
   New-Item -Path $UninstallKey -Force | Out-Null
   # The uninstall runs this script as a script block, not with -File: a company's execution policy
   # (AllSigned) would block an unsigned script file.
-  $UninstallScript = (Join-Path $Target 'install.ps1').Replace("'", "''")
+  $UninstallScript = $Uninstaller.Replace("'", "''")
   $Entry = @{
     DisplayName = 'Caliope'
     DisplayVersion = $Current

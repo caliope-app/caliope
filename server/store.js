@@ -1,11 +1,10 @@
 // Session storage. Each session is a folder under sessions/:
 //   meta.json     small summary used for the session list
 //   session.json  the conversation, frozen system prompt, todos, permissions, checkpoints
-//   blobs/        file contents saved before and after each edit, for rewind
-import fs from 'node:fs';
+//   blobs/        file contents saved before and after each edit, for rewind, and the images in messages
 import fsp from 'node:fs/promises';
 import path from 'node:path';
-import { newId, readJson, writeJsonAtomic, KeyedQueue, sha256 } from './util.js';
+import { newId, readJson, writeJsonAtomic, writeFileAtomic, KeyedQueue, sha256, mapLimit } from './util.js';
 import { toolSpecsFor } from './tools/index.js';
 
 export const SESSION_VERSION = 1;
@@ -24,6 +23,10 @@ export class SessionStore {
     this.saveErrors = new Map();
     this.metas = new Map();
     this.sessions = new Map();
+    // Session id -> its load from disk while it runs, so callers at the same time get the same session object.
+    this.loads = new Map();
+    // Image block -> the blob that holds it, for images already in the session's blobs/ folder.
+    this.imageBlobs = new WeakMap();
     this.queue = new KeyedQueue();
     this.saveStates = new Map();
     this.searchTexts = null;
@@ -32,16 +35,17 @@ export class SessionStore {
   async init() {
     await fsp.mkdir(this.sessionsDir, { recursive: true });
     const entries = await fsp.readdir(this.sessionsDir, { withFileTypes: true });
-    for (const entry of entries) {
-      if (!entry.isDirectory()) continue;
-      const folder = path.join(this.sessionsDir, entry.name);
+    const folders = entries.filter((entry) => entry.isDirectory()).map((entry) => entry.name);
+    const metas = await mapLimit(folders, 16, async (name) => {
       try {
-        const meta = await readJson(path.join(folder, 'meta.json'), null);
-        if (meta?.id === entry.name) this.metas.set(meta.id, normalizeMeta(meta));
+        const meta = await readJson(path.join(this.sessionsDir, name, 'meta.json'), null);
+        return meta?.id === name ? meta : null;
       } catch (error) {
-        this.log.warn(`Session ${entry.name} has an unreadable meta.json; it is hidden from the list.`, error);
+        this.log.warn(`Session ${name} has an unreadable meta.json; it is hidden from the list.`, error);
+        return null;
       }
-    }
+    });
+    for (const meta of metas) if (meta) this.metas.set(meta.id, normalizeMeta(meta));
   }
 
   folder(id) {
@@ -70,30 +74,80 @@ export class SessionStore {
   }
 
   /**
-   * Load a session.
-   * - Repairs a conversation that stopped between a tool call and its result.
-   * - A session saved before tool definitions were stored gets them from its tool names.
+   * A session, loaded from disk the first time.
+   * - Calls while it loads share that load: a second copy would lose what is added to the first.
    */
   async get(id) {
     const cached = this.sessions.get(id);
     if (cached) return cached;
+    if (!this.metas.has(id)) return null;
+    let loading = this.loads.get(id);
+    if (!loading) {
+      loading = this.load(id).finally(() => this.loads.delete(id));
+      this.loads.set(id, loading);
+    }
+    const session = await loading;
+    return session;
+  }
+
+  /**
+   * Read session.json and the images in blobs/.
+   * - Repairs a conversation that stopped between a tool call and its result.
+   * - A session saved before tool definitions were stored gets them from its tool names.
+   */
+  async load(id) {
     const meta = this.metas.get(id);
-    if (!meta) return null;
     const stored = await readJson(path.join(this.folder(id), 'session.json'), null);
     const data = { ...emptyData(), ...(stored || {}) };
     if (data.toolNames && !data.toolSpecs) data.toolSpecs = toolSpecsFor(data.toolNames);
+    await this.loadImages(id, data.messages);
     const session = { meta, data };
+    this.sessions.set(id, session);
     if (repairUnansweredToolCalls(data.messages)) {
       this.log.info(`Session ${id}: added results for tool calls that never ran.`);
       this.save(id);
     }
-    this.sessions.set(id, session);
     return session;
+  }
+
+  /**
+   * Put the images that session.json refers to back into their messages.
+   * - Sessions saved before images went to blobs/ hold the images in session.json. They load as they are.
+   * - An image whose file is missing from the session folder becomes a short note, so the session's requests
+   *   still work.
+   * - Any other read error (a file that antivirus or OneDrive holds) fails the load. The image is then still
+   *   there the next time the session opens.
+   */
+  async loadImages(id, messages) {
+    const references = imageBlocks(messages).filter((image) => image.blob);
+    await mapLimit(references, 8, async (image) => {
+      try {
+        image.data = (await this.readBlob(id, image.blob)).toString('base64');
+        this.imageBlobs.set(image, image.blob);
+      } catch (error) {
+        if (error.code !== 'ENOENT') throw error;
+        this.log.warn(`Session ${id}: an image file is missing from its blobs folder.`, error);
+        delete image.mediaType;
+        Object.assign(image, { type: 'text', text: '(An image was here, but its file is missing from the session folder.)' });
+      }
+      delete image.blob;
+    });
+  }
+
+  /** Write the images that are not in blobs/ yet: new ones, and those of sessions saved before images went there. */
+  async saveImages(id, messages) {
+    for (const image of imageBlocks(messages)) {
+      // An image block without base64 text (a malformed MCP result) stays in session.json as it is.
+      if (this.imageBlobs.has(image) || typeof image.data !== 'string') continue;
+      const hash = await this.writeBlob(id, Buffer.from(image.data, 'base64'));
+      this.imageBlobs.set(image, hash);
+    }
   }
 
   /**
    * Save meta.json and session.json.
    * - Saves of one session never overlap. Calls made while a save waits to start share that save.
+   * - Images go to blobs/ once. session.json refers to them by their hash, so it stays small.
    */
   save(id) {
     let state = this.saveStates.get(id);
@@ -107,7 +161,9 @@ export class SessionStore {
         const session = this.sessions.get(id);
         if (!session || !this.metas.has(id)) return;
         session.meta.messageCount = session.data.messages.length;
-        await writeJsonAtomic(path.join(this.folder(id), 'session.json'), session.data, { pretty: false });
+        await this.saveImages(id, session.data.messages);
+        const stored = { ...session.data, messages: withImageReferences(session.data.messages, this.imageBlobs) };
+        await writeJsonAtomic(path.join(this.folder(id), 'session.json'), stored, { pretty: false });
         await writeJsonAtomic(path.join(this.folder(id), 'meta.json'), session.meta);
         if (this.searchTexts) this.searchTexts.set(id, searchTextFor(session));
         this.saved(id, null);
@@ -202,13 +258,17 @@ export class SessionStore {
     return fork;
   }
 
+  /**
+   * Save file contents or an image under its hash.
+   * - Written through a temporary file, so a crash never leaves half a blob.
+   * - A blob of the same size is already complete and stays as it is. A blob of another size (cut off by an
+   *   older version) is written again.
+   */
   async writeBlob(id, buffer) {
     const hash = sha256(buffer);
     const file = path.join(this.folder(id), 'blobs', hash);
-    if (!fs.existsSync(file)) {
-      await fsp.mkdir(path.dirname(file), { recursive: true });
-      await fsp.writeFile(file, buffer);
-    }
+    const existing = await fsp.stat(file).catch(() => null);
+    if (existing?.size !== buffer.length) await writeFileAtomic(file, buffer);
     return hash;
   }
 
@@ -224,22 +284,25 @@ export class SessionStore {
    *   `snippet` is the first one.
    */
   async search(query, { limit = 50, snippetChars = 180, snippetCount = 1 } = {}) {
-    const terms = String(query).toLowerCase().split(/\s+/).filter(Boolean);
+    // A pattern per word that ignores case. The index keeps the text as written, so it is searched without a
+    // lowercase copy per query, and snippets show the text that way.
+    const terms = String(query).split(/\s+/).filter(Boolean).map((term) => new RegExp(term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i'));
     if (terms.length === 0) return [];
     if (!this.searchTexts) await this.buildSearchIndex();
     const results = [];
     for (const meta of this.metas.values()) {
-      const header = `${meta.title}\n${meta.cwd}`.toLowerCase();
-      const body = this.searchTexts.get(meta.id) || '';
-      const haystack = `${header}\n${body}`;
-      if (!terms.every((term) => haystack.includes(term))) continue;
-      const titleHits = terms.filter((term) => header.includes(term)).length;
+      const header = `${meta.title}\n${meta.cwd}`;
+      const text = this.searchTexts.get(meta.id) || '';
+      if (!terms.every((term) => term.test(header) || term.test(text))) continue;
+      const titleHits = terms.filter((term) => term.test(header)).length;
       const snippets = [];
-      let position = body.indexOf(terms[0]);
-      while (position >= 0 && snippets.length < snippetCount) {
-        const start = Math.max(0, position - Math.round(snippetChars / 3));
-        snippets.push(body.slice(start, start + snippetChars).replace(/\s+/g, ' ').trim());
-        position = body.indexOf(terms[0], start + snippetChars);
+      const firstTerm = new RegExp(terms[0].source, 'gi');
+      let match = firstTerm.exec(text);
+      while (match && snippets.length < snippetCount) {
+        const start = Math.max(0, match.index - Math.round(snippetChars / 3));
+        snippets.push(text.slice(start, start + snippetChars).replace(/\s+/g, ' ').trim());
+        firstTerm.lastIndex = start + snippetChars;
+        match = firstTerm.exec(text);
       }
       results.push({ id: meta.id, title: meta.title, cwd: meta.cwd, updatedAt: meta.updatedAt, archived: meta.archived, snippet: snippets[0] || '', snippets, score: titleHits * 10 + 1 });
     }
@@ -314,8 +377,10 @@ function normalizeMeta(meta) {
     worktree: meta.worktree || null,
     // { id, name, maxCredits } for a run of a scheduled task (see schedules.js).
     schedule: meta.schedule || null,
-    // The month the project's 80% spending notice was shown in this session.
+    // The months the 80% spending notices were shown in this session: for the project's limit, and for the
+    // limit in Settings (see checkMonthlyLimit).
     spendingNoticeMonth: meta.spendingNoticeMonth || null,
+    settingsSpendingNoticeMonth: meta.settingsSpendingNoticeMonth || null,
   };
   return normalized;
 }
@@ -358,6 +423,32 @@ export function repairUnansweredToolCalls(messages) {
   return true;
 }
 
+/** The image blocks of the messages: in the user's prompts and in tool results (screenshots, PDF pages). */
+function imageBlocks(messages) {
+  const images = [];
+  for (const message of messages) {
+    for (const block of message.content || []) {
+      if (block.type === 'image') images.push(block);
+      if (block.type === 'tool_result' && Array.isArray(block.content)) images.push(...block.content.filter((part) => part.type === 'image'));
+    }
+  }
+  return images;
+}
+
+/**
+ * The messages as session.json stores them: each image saved in blobs/ as { type: 'image', mediaType, blob }.
+ * - Only messages with images are copied. The session in memory keeps its images.
+ */
+function withImageReferences(messages, imageBlobs) {
+  const reference = (part) => (part.type === 'image' && imageBlobs.has(part) ? { type: 'image', mediaType: part.mediaType, blob: imageBlobs.get(part) } : part);
+  const stored = messages.map((message) => {
+    if (imageBlocks([message]).length === 0) return message;
+    const content = message.content.map((block) => (block.type === 'tool_result' && Array.isArray(block.content) ? { ...block, content: block.content.map(reference) } : reference(block)));
+    return { ...message, content };
+  });
+  return stored;
+}
+
 function searchTextFor(session) {
   const parts = [];
   let length = 0;
@@ -373,7 +464,7 @@ function searchTextFor(session) {
     }
     if (length > 300000) break;
   }
-  const text = parts.join('\n').toLowerCase();
+  const text = parts.join('\n');
   return text;
 }
 

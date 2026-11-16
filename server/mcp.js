@@ -5,15 +5,19 @@
 //   mcp__<server>__<tool>.
 // - A server starts when a session needs it and keeps running for the sessions in that folder until
 //   Caliope closes or the server stops by itself. Changed settings start a new one.
+// - An HTTP server that asks for a sign-in gets one through OAuth, as the MCP authorization spec describes:
+//   Settings → MCP servers → Sign in (see McpHub.signIn). The tokens are saved encrypted, by server address.
+import crypto from 'node:crypto';
 import fsp from 'node:fs/promises';
+import http from 'node:http';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { APP_VERSION } from './config.js';
 import { commandEnvironment } from './tools/shell.js';
-import { killProcessTree } from './windows.js';
+import { killProcessTree, protectSecret, unprotectSecret } from './windows.js';
 import { readSseEvents } from './sse-parser.js';
 import { pathKey } from './tools/paths.js';
-import { isPlainObject, truncateMiddle } from './util.js';
+import { isPlainObject, readJson, truncateMiddle, writeJsonAtomic } from './util.js';
 
 const PROTOCOL_VERSION = '2025-06-18';
 // npx may first download the server.
@@ -26,6 +30,10 @@ const MAX_PROJECT_SERVERS = 30;
 const MAX_LINE_CHARS = 20 * 1024 * 1024;
 const NOTIFY_TIMEOUT_MS = 15000;
 const SERVER_NAME = /^[A-Za-z0-9_-]{1,40}$/;
+// How long a sign-in waits for the browser to come back.
+const SIGN_IN_TIMEOUT_MS = 5 * 60 * 1000;
+// An access token this close to its expiry is refreshed before the next request.
+const REFRESH_MARGIN_MS = 60 * 1000;
 
 /**
  * Check MCP server settings, { name: server }. Throws a message naming the problem.
@@ -97,6 +105,12 @@ function expandVariables(text) {
   return expanded;
 }
 
+/** The headers from an HTTP server's settings, with variables expanded. */
+function serverHeaders(server) {
+  const headers = Object.fromEntries(Object.entries(server.headers).map(([key, value]) => [key, expandVariables(value)]));
+  return headers;
+}
+
 /** A tool name the model APIs accept (letters, digits, _ and -, up to 64). */
 function toolNameFor(server, tool) {
   const name = `mcp__${server}__${String(tool).replace(/[^A-Za-z0-9_-]/g, '_')}`.slice(0, 64);
@@ -107,11 +121,12 @@ class McpError extends Error {}
 
 /** One running server: requests and their answers over stdio or HTTP. */
 class McpConnection {
-  constructor({ name, server, cwd, extraPath, onClose }) {
+  constructor({ name, server, cwd, extraPath, signIns, onClose }) {
     this.name = name;
     this.server = server;
     this.cwd = cwd;
     this.extraPath = extraPath;
+    this.signIns = signIns;
     this.onClose = onClose;
     this.nextId = 1;
     this.pending = new Map();
@@ -234,12 +249,23 @@ class McpConnection {
       return;
     }
     // Streamable HTTP: each message is a POST. The answer comes as JSON or as an event stream.
-    const headers = { 'Content-Type': 'application/json', Accept: 'application/json, text/event-stream', ...Object.fromEntries(Object.entries(this.server.headers).map(([key, value]) => [key, expandVariables(value)])) };
+    const url = expandVariables(this.server.url);
+    const headers = { 'Content-Type': 'application/json', Accept: 'application/json, text/event-stream', ...serverHeaders(this.server) };
     if (this.httpSession) headers['Mcp-Session-Id'] = this.httpSession;
     if (this.protocolVersion) headers['MCP-Protocol-Version'] = this.protocolVersion;
-    const response = await fetch(expandVariables(this.server.url), { method: 'POST', headers, body: JSON.stringify(message), signal });
+    // A server the user signed in to gets its OAuth token on every request, in place of a header from the settings.
+    const post = (authorization) => fetch(url, { method: 'POST', headers: authorization ? { ...headers, Authorization: authorization } : headers, body: JSON.stringify(message), signal });
+    const signedIn = await this.signIns.authorization(this.server.url);
+    let response = await post(signedIn);
+    // The server can end a token before it expires. A refreshed token gets one more try.
+    if (response.status === 401 && signedIn) {
+      await response.body?.cancel().catch(() => {});
+      const refreshed = await this.signIns.authorization(this.server.url, { force: true });
+      if (refreshed) response = await post(refreshed);
+    }
     this.httpSession = response.headers.get('mcp-session-id') || this.httpSession;
-    if (response.status === 401 || response.status === 403) throw new McpError(`the server refused the sign-in (HTTP ${response.status}). Caliope sends the headers from the server's settings; servers that need an OAuth sign-in are not supported.`);
+    if (response.status === 401) throw new McpError(signedIn ? 'no longer accepts the sign-in (HTTP 401). Choose Sign in for it again in Settings → MCP servers' : 'asks for a sign-in (HTTP 401). Choose Sign in for it in Settings → MCP servers, or put a token in the server\'s headers');
+    if (response.status === 403) throw new McpError('refused the request (HTTP 403). The sign-in or the token in the headers lacks a permission the server needs');
     if (!response.ok) throw new McpError(`HTTP ${response.status}: ${(await response.text()).slice(0, 300)}`);
     // Only Caliope's own requests get answers. For notifications and replies the body is not needed.
     if (!message.method || message.id === undefined) {
@@ -276,11 +302,303 @@ class McpConnection {
   }
 }
 
+/**
+ * OAuth sign-ins of HTTP MCP servers, by the server address as written in the settings, in `file` next to
+ * settings.json. The address is kept unexpanded, so a ${env:...} variable in it is not written to the file.
+ * - Encrypted for this Windows user (DPAPI) like the GitHub sign-in; plain only where `plainSecrets` is set
+ *   (tests, other systems). Without a file (tests of other parts), there are no sign-ins.
+ * - A sign-in: { issuer, tokenEndpoint, clientId, clientSecret, clientAuth, resource, accessToken, refreshToken, expiresAt }.
+ */
+class McpSignIns {
+  constructor({ file, plainSecrets, log }) {
+    this.file = file;
+    this.plainSecrets = plainSecrets;
+    this.log = log;
+    this.cache = new Map();
+    this.refreshing = new Map();
+    this.saving = Promise.resolve();
+  }
+
+  /** The saved sign-in for `url`, or null. One that cannot be decrypted (another Windows user) counts as none. */
+  async get(url) {
+    if (!this.file) return null;
+    if (!this.cache.has(url)) {
+      const stored = (await readJson(this.file, {}))[url];
+      let signIn = null;
+      try {
+        signIn = stored?.dpapi ? JSON.parse(await unprotectSecret(stored.dpapi)) : stored?.plain || null;
+      } catch {
+        // Sign in again.
+      }
+      this.cache.set(url, signIn);
+    }
+    return this.cache.get(url);
+  }
+
+  /**
+   * Keep the sign-in for `url` in memory and save it in the file.
+   * - Returns null, or why it could not be saved, for example on a Node.js without node:ffi (see callDpapi). It then
+   *   lasts until Caliope closes, as the GitHub sign-in does.
+   */
+  async save(url, signIn) {
+    this.cache.set(url, signIn);
+    // One write at a time, so two refreshes at once do not drop each other's tokens.
+    const write = this.saving.then(async () => {
+      const stored = await readJson(this.file, {});
+      stored[url] = this.plainSecrets ? { plain: signIn } : { dpapi: await protectSecret(JSON.stringify(signIn)) };
+      await writeJsonAtomic(this.file, stored);
+    });
+    this.saving = write.catch(() => {});
+    try {
+      await write;
+      return null;
+    } catch (error) {
+      this.log.warn(`The MCP sign-in for ${url} could not be saved; it lasts until Caliope closes.`, error.message);
+      return error.message;
+    }
+  }
+
+  /** Sign out of `url`: its tokens leave memory and the file. */
+  async remove(url) {
+    // null, not deleted: a request meanwhile would otherwise read the tokens back from the file before it is written.
+    this.cache.set(url, null);
+    const write = this.saving.then(async () => {
+      const stored = await readJson(this.file, {});
+      if (!(url in stored)) return;
+      delete stored[url];
+      await writeJsonAtomic(this.file, stored);
+    });
+    this.saving = write.catch(() => {});
+    await write;
+  }
+
+  /**
+   * The Authorization header for `url`, or null without a usable sign-in.
+   * - An access token that expires soon, or any token with `force` (after a 401), is refreshed first.
+   */
+  async authorization(url, { force = false } = {}) {
+    let signIn = await this.get(url);
+    if (signIn && (force || (signIn.expiresAt && signIn.expiresAt - REFRESH_MARGIN_MS < Date.now()))) signIn = await this.refresh(url, signIn);
+    const header = signIn ? `Bearer ${signIn.accessToken}` : null;
+    return header;
+  }
+
+  /**
+   * New tokens from the refresh token, saved; null when there is none or the server refuses it.
+   * - Sessions in several folders share a sign-in, and a refresh token may work only once: they share one refresh.
+   */
+  refresh(url, signIn) {
+    if (!this.refreshing.has(url)) {
+      const refreshing = (async () => {
+        if (!signIn.refreshToken) return null;
+        let tokens;
+        try {
+          tokens = await tokenRequest(signIn, { grant_type: 'refresh_token', refresh_token: signIn.refreshToken });
+        } catch {
+          return null;
+        }
+        // The server may keep the refresh token and leave it out of the answer.
+        const refreshed = { ...signIn, ...tokens, refreshToken: tokens.refreshToken || signIn.refreshToken };
+        await this.save(url, refreshed);
+        return refreshed;
+      })().finally(() => this.refreshing.delete(url));
+      this.refreshing.set(url, refreshing);
+    }
+    return this.refreshing.get(url);
+  }
+}
+
+/**
+ * A token request (OAuth 2.1 section 3.2) for the sign-in's client and resource.
+ * - Returns { accessToken, refreshToken, expiresAt }. Throws the server's reason when it refuses.
+ */
+async function tokenRequest(signIn, params) {
+  const body = new URLSearchParams({ ...params, client_id: signIn.clientId, resource: signIn.resource });
+  const headers = { 'Content-Type': 'application/x-www-form-urlencoded', Accept: 'application/json' };
+  // A client the server registered with a secret sends it the way the registration says.
+  if (signIn.clientSecret && signIn.clientAuth === 'client_secret_basic') headers.Authorization = `Basic ${Buffer.from(`${encodeURIComponent(signIn.clientId)}:${encodeURIComponent(signIn.clientSecret)}`).toString('base64')}`;
+  else if (signIn.clientSecret) body.set('client_secret', signIn.clientSecret);
+  const response = await fetch(signIn.tokenEndpoint, { method: 'POST', headers, body, signal: AbortSignal.timeout(30000) });
+  const answer = await response.json().catch(() => ({}));
+  if (!response.ok || typeof answer.access_token !== 'string') throw new McpError(answer.error_description || answer.error || `HTTP ${response.status}`);
+  const tokens = { accessToken: answer.access_token, refreshToken: answer.refresh_token || null, expiresAt: answer.expires_in ? Date.now() + Number(answer.expires_in) * 1000 : null };
+  return tokens;
+}
+
+/** A JSON document, or null when the address does not answer with one. */
+async function getJson(url) {
+  try {
+    const response = await fetch(url, { headers: { Accept: 'application/json' }, signal: AbortSignal.timeout(30000) });
+    const document = response.ok ? await response.json() : null;
+    return isPlainObject(document) ? document : null;
+  } catch {
+    return null;
+  }
+}
+
+/** The parameters of a WWW-Authenticate header, such as resource_metadata and scope (RFC 6750 section 3). */
+function challengeParameters(header) {
+  const parameters = {};
+  for (const [, key, quoted, plain] of String(header || '').matchAll(/([A-Za-z_]+)=(?:"((?:[^"\\]|\\.)*)"|([^\s,]+))/g)) parameters[key.toLowerCase()] = quoted ?? plain;
+  return parameters;
+}
+
+/** True for an https address, or http on this PC. The sign-in sends codes and tokens to these addresses. */
+function secureAddress(address) {
+  const parsed = new URL(address);
+  const secure = parsed.protocol === 'https:' || (parsed.protocol === 'http:' && ['127.0.0.1', 'localhost', '[::1]'].includes(parsed.hostname));
+  return secure;
+}
+
+/**
+ * The protected resource metadata (RFC 9728) of the MCP server at `url`: at the address from the 401 answer, or
+ * else at the well-known address with the server's path, then at the root.
+ * - Its `resource` must be the server's address or a part of its origin above it, and it must name an authorization server.
+ */
+async function protectedResourceMetadata(name, url, fromChallenge) {
+  const address = new URL(url);
+  const serverPath = address.pathname.replace(/\/$/, '');
+  const candidates = fromChallenge ? [fromChallenge] : [...(serverPath ? [`${address.origin}/.well-known/oauth-protected-resource${serverPath}`] : []), `${address.origin}/.well-known/oauth-protected-resource`];
+  for (const candidate of candidates) {
+    // The metadata names the authorization server, so it must come over https too.
+    if (!URL.canParse(candidate) || !secureAddress(candidate)) throw new McpError(`The MCP server "${name}" describes its sign-in at an address without https (${candidate}), so Caliope does not sign in.`);
+    const metadata = await getJson(candidate);
+    if (!metadata) continue;
+    const resource = URL.canParse(metadata.resource) ? new URL(metadata.resource) : null;
+    const resourcePath = resource?.pathname.replace(/\/$/, '');
+    const covers = resource && resource.origin === address.origin && (address.pathname === resourcePath || address.pathname.startsWith(`${resourcePath}/`));
+    if (!covers) throw new McpError(`The MCP server "${name}" describes its sign-in for another address (${metadata.resource}), so Caliope does not sign in.`);
+    if (typeof metadata.authorization_servers?.[0] !== 'string') throw new McpError(`The MCP server "${name}" names no authorization server to sign in with.`);
+    return metadata;
+  }
+  throw new McpError(`The MCP server "${name}" asks for a sign-in but does not describe it (OAuth protected resource metadata), so Caliope cannot sign in. Put a token in its headers instead.`);
+}
+
+/**
+ * The metadata of an authorization server (RFC 8414 or OpenID Connect Discovery), tried at the addresses the MCP
+ * spec lists for an issuer with or without a path.
+ * - The document must name the same issuer, or another server could stand in for it.
+ */
+async function authorizationServerMetadata(name, issuer) {
+  const address = new URL(issuer);
+  const issuerPath = address.pathname.replace(/\/$/, '');
+  const candidates = issuerPath
+    ? [`${address.origin}/.well-known/oauth-authorization-server${issuerPath}`, `${address.origin}/.well-known/openid-configuration${issuerPath}`, `${address.origin}${issuerPath}/.well-known/openid-configuration`]
+    : [`${address.origin}/.well-known/oauth-authorization-server`, `${address.origin}/.well-known/openid-configuration`];
+  for (const candidate of candidates) {
+    const metadata = await getJson(candidate);
+    if (metadata?.issuer === issuer) return metadata;
+  }
+  throw new McpError(`Caliope could not read the sign-in settings of ${issuer}, the authorization server of "${name}".`);
+}
+
+/**
+ * A one-time web server on 127.0.0.1, at a random port, for the browser's redirect after the sign-in.
+ * - Returns { redirectUri, answer, close }. `answer` resolves with the query parameters of the redirect that carries
+ *   `state`, or with null when none came within SIGN_IN_TIMEOUT_MS.
+ * - A request with another state is refused, and the wait goes on: another program on this PC that finds the port
+ *   cannot end the sign-in with an answer of its own.
+ */
+async function loopbackRedirect(state) {
+  let deliver;
+  const answer = new Promise((resolve) => {
+    deliver = resolve;
+  });
+  const server = http.createServer((request, response) => {
+    const address = new URL(request.url, 'http://127.0.0.1');
+    if (address.pathname !== '/callback' || address.searchParams.get('state') !== state) {
+      response.writeHead(404);
+      response.end();
+      return;
+    }
+    response.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    response.end('<!doctype html><meta charset="utf-8"><title>Caliope</title><p>You can close this tab and go back to Caliope.</p>');
+    deliver(address.searchParams);
+  });
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  const timer = setTimeout(() => deliver(null), SIGN_IN_TIMEOUT_MS);
+  const close = () => {
+    clearTimeout(timer);
+    server.close();
+  };
+  const redirect = { redirectUri: `http://127.0.0.1:${server.address().port}/callback`, answer, close };
+  return redirect;
+}
+
 /** The running MCP servers, shared by the sessions in one folder. */
 export class McpHub {
-  constructor({ log }) {
+  /** `signInFile`: where OAuth sign-ins are saved (see McpSignIns). */
+  constructor({ log, signInFile = null, plainSecrets = false }) {
     this.log = log;
     this.connections = new Map();
+    this.signIns = new McpSignIns({ file: signInFile, plainSecrets, log });
+  }
+
+  /**
+   * Sign in to an HTTP MCP server with OAuth, as the MCP authorization spec describes, and save the tokens for its address.
+   * - The server's 401 answer leads to its protected resource metadata, which names the authorization server.
+   * - Caliope registers itself there (dynamic client registration) and opens the sign-in page with `openUrl`. The page
+   *   sends the browser back to 127.0.0.1 with a code, which Caliope exchanges with PKCE (S256).
+   * - Throws a message for the user when the server needs no sign-in, or offers no sign-in Caliope can use.
+   * - Returns null, or why the tokens could not be saved: the sign-in then lasts until Caliope closes.
+   */
+  async signIn({ name, server, openUrl }) {
+    const url = expandVariables(server.url);
+    // An initialize request without a token: the 401 answer says where to sign in.
+    const initialize = { jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: PROTOCOL_VERSION, capabilities: {}, clientInfo: { name: 'Caliope', version: APP_VERSION } } };
+    const probe = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'application/json, text/event-stream', ...serverHeaders(server) }, body: JSON.stringify(initialize), signal: AbortSignal.timeout(30000) });
+    await probe.body?.cancel().catch(() => {});
+    if (probe.status !== 401) throw new McpError(probe.ok ? `The MCP server "${name}" does not ask for a sign-in.` : `The MCP server "${name}" answered HTTP ${probe.status} instead of asking for a sign-in.`);
+    const challenge = challengeParameters(probe.headers.get('www-authenticate'));
+    const resourceMetadata = await protectedResourceMetadata(name, url, challenge.resource_metadata);
+    const issuer = resourceMetadata.authorization_servers[0];
+    if (!secureAddress(issuer)) throw new McpError(`The authorization server of "${name}" does not use https, so Caliope does not sign in.`);
+    const metadata = await authorizationServerMetadata(name, issuer);
+    // The spec requires PKCE, and an authorization server that does not list S256 may not check it.
+    if (!metadata.code_challenge_methods_supported?.includes('S256')) throw new McpError(`The authorization server of "${name}" does not support PKCE (S256), so Caliope does not sign in.`);
+    if (typeof metadata.registration_endpoint !== 'string') throw new McpError(`The authorization server of "${name}" does not let apps register themselves (dynamic client registration), which Caliope needs. Put a token in the server's headers instead.`);
+    if (![metadata.authorization_endpoint, metadata.token_endpoint, metadata.registration_endpoint].every((endpoint) => typeof endpoint === 'string' && secureAddress(endpoint))) throw new McpError(`The authorization server of "${name}" gives sign-in addresses without https, so Caliope does not sign in.`);
+
+    const state = crypto.randomBytes(16).toString('base64url');
+    const redirect = await loopbackRedirect(state);
+    try {
+      // A new registration for each sign-in: the redirect address has a new port each time, and servers compare it exactly.
+      const registration = { client_name: 'Caliope', redirect_uris: [redirect.redirectUri], grant_types: ['authorization_code', 'refresh_token'], response_types: ['code'], token_endpoint_auth_method: 'none', application_type: 'native' };
+      const registered = await fetch(metadata.registration_endpoint, { method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'application/json' }, body: JSON.stringify(registration), signal: AbortSignal.timeout(30000) });
+      const client = await registered.json().catch(() => ({}));
+      if (!registered.ok || typeof client.client_id !== 'string') throw new McpError(`The authorization server of "${name}" refused to register Caliope: ${client.error_description || client.error || `HTTP ${registered.status}`}.`);
+
+      const verifier = crypto.randomBytes(32).toString('base64url');
+      // Scopes: the ones the 401 asked for, else the server's list. offline_access asks for a refresh token where the server offers one.
+      const scopes = (challenge.scope || resourceMetadata.scopes_supported?.join(' ') || '').split(' ').filter(Boolean);
+      if (scopes.length > 0 && metadata.scopes_supported?.includes('offline_access') && !scopes.includes('offline_access')) scopes.push('offline_access');
+      const authorizationUrl = new URL(metadata.authorization_endpoint);
+      const query = { response_type: 'code', client_id: client.client_id, redirect_uri: redirect.redirectUri, code_challenge: crypto.createHash('sha256').update(verifier).digest('base64url'), code_challenge_method: 'S256', state, resource: resourceMetadata.resource, ...(scopes.length ? { scope: scopes.join(' ') } : {}) };
+      for (const [key, value] of Object.entries(query)) authorizationUrl.searchParams.set(key, value);
+      openUrl(authorizationUrl.href);
+
+      const answer = await redirect.answer;
+      if (!answer) throw new McpError(`The sign-in for "${name}" was not finished within ${SIGN_IN_TIMEOUT_MS / 60000} minutes.`);
+      // RFC 9207: an answer from another authorization server is ignored, also its error.
+      const iss = answer.get('iss');
+      if (iss !== null ? iss !== metadata.issuer : metadata.authorization_response_iss_parameter_supported === true) throw new McpError(`The sign-in answer for "${name}" did not come from its authorization server, so Caliope ignored it.`);
+      if (answer.get('error')) throw new McpError(`The sign-in for "${name}" did not succeed: ${answer.get('error_description') || answer.get('error')}.`);
+
+      const signIn = { issuer, tokenEndpoint: metadata.token_endpoint, clientId: client.client_id, clientSecret: client.client_secret || null, clientAuth: client.token_endpoint_auth_method || 'none', resource: resourceMetadata.resource };
+      let tokens;
+      try {
+        tokens = await tokenRequest(signIn, { grant_type: 'authorization_code', code: answer.get('code') || '', redirect_uri: redirect.redirectUri, code_verifier: verifier });
+      } catch (error) {
+        throw new McpError(`The authorization server of "${name}" did not give a token for the sign-in: ${error.message}.`);
+      }
+      const saveFailed = await this.signIns.save(server.url, { ...signIn, ...tokens });
+      return saveFailed;
+    } finally {
+      redirect.close();
+    }
   }
 
   /** The running connection for a server (started when needed). */
@@ -288,7 +606,7 @@ export class McpHub {
     const key = `${pathKey(cwd)}|${name}|${JSON.stringify(server)}`;
     let entry = this.connections.get(key);
     if (!entry) {
-      const connection = new McpConnection({ name, server, cwd, extraPath, onClose: () => this.connections.delete(key) });
+      const connection = new McpConnection({ name, server, cwd, extraPath, signIns: this.signIns, onClose: () => this.connections.delete(key) });
       const started = connection.start().catch((error) => {
         connection.close(error.message);
         this.connections.delete(key);

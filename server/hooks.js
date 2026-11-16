@@ -21,7 +21,10 @@ export function validateHooks(hooks) {
   return valid;
 }
 
-/** Run the hooks whose pattern matches `file` (relative to `cwd`); returns [{ command, exitCode, timedOut, output }]. */
+/**
+ * Run the hooks whose pattern matches `file` (relative to `cwd`); returns [{ command, exitCode, timedOut, output }].
+ * - `shell`: the shell the commands really run in (effectiveShell), which decides how {file} is quoted.
+ */
 export async function runEditHooks(hooks, { cwd, file, shell, extraPath, tmpDir, signal }) {
   const results = [];
   for (const hook of hooks) {

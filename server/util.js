@@ -53,12 +53,19 @@ export async function readJson(file, fallback) {
 
 /**
  * Write a file through a temporary file and a rename, so readers never see half a file.
+ * - The temporary file is flushed to disk before the rename, so a power cut cannot leave an empty file.
  * - Windows can briefly lock the target (antivirus, indexer). The rename is retried a few times.
  */
 export async function writeFileAtomic(file, data) {
   await fsp.mkdir(path.dirname(file), { recursive: true });
   const temporaryFile = `${file}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`;
-  await fsp.writeFile(temporaryFile, data);
+  const handle = await fsp.open(temporaryFile, 'w');
+  try {
+    await handle.writeFile(data);
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
   for (let attempt = 0; ; attempt++) {
     try {
       await fsp.rename(temporaryFile, file);

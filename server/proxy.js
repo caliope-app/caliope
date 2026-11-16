@@ -5,6 +5,7 @@
 // - Node.js cannot use proxy scripts (PAC) or proxies that need the Windows sign-in (NTLM, Kerberos).
 import http from 'node:http';
 import { execFile } from 'node:child_process';
+import { systemProgram } from './windows.js';
 
 const LOOPBACK = ['localhost', '127.0.0.1', '::1'];
 const VARIABLES = ['HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY', 'NODE_USE_ENV_PROXY'];
@@ -67,7 +68,7 @@ export function validateProxyUrl(value) {
 /** The proxy Windows itself uses (Internet Options), as a hint for Settings; see parseInternetSettings. */
 export function windowsProxy() {
   return new Promise((resolve) => {
-    execFile('reg.exe', ['query', 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings'], { windowsHide: true, timeout: 5000 }, (_error, stdout) => resolve(parseInternetSettings(String(stdout || ''))));
+    execFile(systemProgram('reg.exe'), ['query', 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings'], { windowsHide: true, timeout: 5000 }, (_error, stdout) => resolve(parseInternetSettings(String(stdout || ''))));
   });
 }
 

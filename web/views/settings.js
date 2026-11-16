@@ -1,10 +1,11 @@
 // Settings page.
-import { h, clear, formatTokens, relativeTime } from '../lib/dom.js';
+import { h, clear, keepDraft, redrawAfterEditing, formatTokens, relativeTime } from '../lib/dom.js';
 import { icon } from '../lib/icons.js';
 import { api } from '../lib/api.js';
 import { state, on } from '../lib/store.js';
 import * as actions from '../lib/actions.js';
-import { toast, toastError } from './dialogs.js';
+import { confirmDialog, toast, toastError } from './dialogs.js';
+import { showHelp } from './composer.js';
 
 const SECTIONS = [
   ['account', 'Account'],
@@ -23,6 +24,9 @@ const SECTIONS = [
 export function mountSettings(container) {
   const subscriptions = [];
   let section = 'account';
+  // Text typed in the MCP forms and not added yet (keepDraft). A redraw of the page puts it back. Other fields save
+  // when they change, and the page never redraws while one has the focus (redrawAfterEditing).
+  const drafts = {};
   const nav = h('nav', { class: 'settings-nav' });
   const content = h('div');
   const page = h('div', { class: 'page' }, h('div', { class: 'page-inner' }, h('h1', {}, 'Settings'), h('p', { class: 'lead' }, 'Saved for your Windows account on this PC. New sessions pick up instruction and tool changes. Running sessions keep what they started with.'), h('div', { class: 'settings-layout' }, nav, content)));
@@ -37,13 +41,22 @@ export function mountSettings(container) {
     const builders = { account, models, permissions, commands, instructions, skills, mcp: mcpServers, budget, network, appearance, app };
     content.append(builders[section](settings));
   }
+  const redraw = redrawAfterEditing(content, render);
 
+  let fieldCount = 0;
+  /** A setting: its label and help on the left, the control on the right. The control's first field is named by the label. */
   function field(label, help, control) {
-    return h('div', { class: 'field' }, h('div', {}, h('div', { class: 'field-label' }, label), help ? h('div', { class: 'field-help' }, help) : null), h('div', {}, control));
+    const id = `setting-${++fieldCount}`;
+    const input = control.matches('input, select, textarea') ? control : control.querySelector('input, select, textarea');
+    input?.setAttribute('aria-labelledby', `${id}-label`);
+    if (help) input?.setAttribute('aria-describedby', `${id}-help`);
+    const element = h('div', { class: 'field' }, h('div', {}, h('div', { class: 'field-label', id: `${id}-label` }, label), help ? h('div', { class: 'field-help', id: `${id}-help` }, help) : null), h('div', {}, control));
+    return element;
   }
 
-  function select(value, options, onChange) {
-    const element = h('select', { class: 'select' }, options.map(([optionValue, label]) => h('option', { value: optionValue ?? '' }, label)));
+  /** - `name`: for a second select in one field, which the field's label does not name. */
+  function select(value, options, onChange, name = null) {
+    const element = h('select', { class: 'select', 'aria-label': name }, options.map(([optionValue, label]) => h('option', { value: optionValue ?? '' }, label)));
     element.value = value ?? '';
     element.addEventListener('change', () => onChange(element.value));
     return element;
@@ -68,6 +81,7 @@ export function mountSettings(container) {
     return input;
   }
 
+  /** One entry per line. */
   function textList(value, placeholder, onSave, rows = 4) {
     const area = h('textarea', { class: 'textarea mono', rows, placeholder, style: { fontSize: '12.5px' } });
     area.value = (value || []).join('\n');
@@ -82,8 +96,8 @@ export function mountSettings(container) {
     const wrapper = h('div', { class: 'card' });
     if (auth.signedIn) {
       wrapper.append(
-        field('Signed in', auth.kind === 'oauth' ? 'GitHub sign-in (Caliope app).' : auth.kind === 'device' ? 'GitHub sign-in (Copilot editor-plugin identity).' : 'Personal access token (Copilot CLI identity).', h('div', { class: 'stack' }, h('strong', {}, auth.login || 'Unknown account'), h('span', { class: 'faint' }, auth.savedAt ? `Since ${new Date(auth.savedAt).toLocaleString()}` : ''), auth.saveFailed ? h('span', { class: 'danger-text' }, 'Not saved: PowerShell is restricted on this PC, so Windows could not encrypt the sign-in. Sign in again after Caliope restarts.') : null)),
-        field('Switch or remove', 'Signing out deletes the saved token from this PC. Sessions stay.', h('div', { class: 'row' }, h('button', { class: 'btn', onClick: () => actions.showView('signin') }, 'Use another token'), h('button', { class: 'btn danger', onClick: actions.signOut }, h('span', { html: icon('log-out', 14) }), 'Sign out'))),
+        field('Signed in', auth.kind === 'oauth' ? 'GitHub sign-in (Caliope app).' : auth.kind === 'device' ? 'GitHub sign-in (Copilot editor-plugin identity).' : 'Personal access token (Copilot CLI identity).', h('div', { class: 'stack' }, h('strong', {}, auth.login || 'Unknown account'), h('span', { class: 'faint' }, auth.savedAt ? `Since ${new Date(auth.savedAt).toLocaleString('en-US', { dateStyle: 'medium', timeStyle: 'short' })}` : ''), auth.saveFailed ? h('span', { class: 'danger-text' }, `Not saved: ${auth.saveFailed} Sign in again after Caliope restarts.`) : null)),
+        field('Switch or remove', 'Signing out deletes the saved sign-in from this PC. Sessions stay.', h('div', { class: 'row' }, h('button', { class: 'btn', onClick: () => actions.showView('signin') }, 'Switch account'), h('button', { class: 'btn danger', onClick: actions.signOut }, h('span', { html: icon('log-out', 14) }), 'Sign out'))),
       );
     } else {
       wrapper.append(field('Not signed in', auth.error || 'Connect your own GitHub Copilot subscription.', h('button', { class: 'btn primary', onClick: () => actions.showView('signin') }, 'Sign in')));
@@ -263,6 +277,18 @@ export function mountSettings(container) {
       }
     }
 
+    // An HTTP server that asks for an OAuth sign-in: its sign-in page opens in the browser.
+    async function signIn(name) {
+      checkResult.textContent = `Sign in to ${name} in your browser…`;
+      try {
+        const { saveFailed } = await api.post('/api/mcp/sign-in', { name });
+        // A sign-in that could not be saved works until Caliope closes.
+        checkResult.textContent = saveFailed ? `Signed in to ${name} until Caliope closes: the sign-in could not be saved. ${saveFailed}` : `Signed in to ${name}. New sessions get its tools.`;
+      } catch (error) {
+        checkResult.textContent = error.message;
+      }
+    }
+
     const rows = Object.entries(servers).map(([name, server]) =>
       h(
         'tr',
@@ -273,16 +299,23 @@ export function mountSettings(container) {
           'td',
           { style: { whiteSpace: 'nowrap', textAlign: 'right' } },
           h('button', { class: 'btn small', onClick: () => check(name) }, 'Check'),
-          h('button', { class: 'btn ghost small icon-only', title: `Remove ${name}`, 'aria-label': `Remove ${name}`, html: icon('trash-2', 13), onClick: () => saveServers(Object.fromEntries(Object.entries(servers).filter(([other]) => other !== name))) }),
+          server.url ? h('button', { class: 'btn small', title: 'For servers that ask for a sign-in (OAuth)', onClick: () => signIn(name) }, 'Sign in') : null,
+          h('button', { class: 'btn ghost small icon-only', title: `Remove ${name}`, 'aria-label': `Remove ${name}`, html: icon('trash-2', 13), onClick: () => removeServer(name) }),
         ),
       ),
     );
 
-    const nameInput = h('input', { class: 'input', placeholder: 'ado', style: { maxWidth: '160px' } });
-    const commandInput = h('input', { class: 'input mono', placeholder: 'npx -y @azure-devops/mcp your-organization   or   https://example.com/mcp' });
-    const extraInput = h('textarea', { class: 'textarea mono', rows: 3, placeholder: 'Program: environment variables, NAME=value per line\nHTTP: headers, Name: value per line (${env:TOKEN} reads a variable)', style: { fontSize: '12.5px' } });
-    const orgInput = h('input', { class: 'input', placeholder: 'Organization, for example contoso', style: { maxWidth: '260px' } });
-    function add() {
+    async function removeServer(name) {
+      const ok = await confirmDialog({ title: `Remove the MCP server "${name}"?`, message: 'New sessions no longer get its tools. Running sessions keep them until they end.', confirmLabel: 'Remove server', danger: true });
+      if (ok) saveServers(Object.fromEntries(Object.entries(servers).filter(([other]) => other !== name)));
+    }
+
+    // The forms keep what is typed as drafts until it is added.
+    const nameInput = keepDraft(h('input', { class: 'input', placeholder: 'ado', 'aria-label': 'Server name', style: { maxWidth: '160px' } }), drafts, 'mcpName');
+    const commandInput = keepDraft(h('input', { class: 'input mono', placeholder: 'npx -y @azure-devops/mcp your-organization   or   https://example.com/mcp', 'aria-label': 'Command or address' }), drafts, 'mcpCommand');
+    const extraInput = keepDraft(h('textarea', { class: 'textarea mono', rows: 3, placeholder: 'Program: environment variables, NAME=value per line\nHTTP: headers, Name: value per line (${env:TOKEN} reads a variable)', 'aria-label': 'Environment variables or headers', style: { fontSize: '12.5px' } }), drafts, 'mcpExtra');
+    const orgInput = keepDraft(h('input', { class: 'input', placeholder: 'Organization, for example contoso', 'aria-label': 'Azure DevOps organization', style: { maxWidth: '260px' } }), drafts, 'mcpOrganization');
+    async function add() {
       const name = nameInput.value.trim();
       const line = commandInput.value.trim();
       if (!name || !line) {
@@ -292,16 +325,26 @@ export function mountSettings(container) {
       const isUrl = /^https?:\/\//i.test(line);
       const [command, ...args] = words(line);
       const server = isUrl ? { url: line, headers: pairs(extraInput.value, ':') } : { command, args, env: pairs(extraInput.value, '=') };
-      saveServers({ ...servers, [name]: server });
+      if (await actions.saveSettings({ mcpServers: { ...servers, [name]: server } })) {
+        delete drafts.mcpName;
+        delete drafts.mcpCommand;
+        delete drafts.mcpExtra;
+        render();
+        toast('Saved. New sessions get these tools.');
+      }
     }
-    function azureDevOps() {
+    async function azureDevOps() {
       const organization = orgInput.value.trim();
       if (!organization) {
         toast('Enter your Azure DevOps organization first.', { kind: 'error' });
         return;
       }
       // The core, work items, repositories, pipelines and wiki tools. Every domain adds many tool definitions.
-      saveServers({ ...servers, ado: { command: 'npx', args: ['-y', '@azure-devops/mcp', organization, '-d', 'core', 'work', 'work-items', 'repositories', 'pipelines', 'wiki'], env: {} } });
+      if (await actions.saveSettings({ mcpServers: { ...servers, ado: { command: 'npx', args: ['-y', '@azure-devops/mcp', organization, '-d', 'core', 'work', 'work-items', 'repositories', 'pipelines', 'wiki'], env: {} } } })) {
+        delete drafts.mcpOrganization;
+        render();
+        toast('Saved. New sessions get these tools.');
+      }
     }
 
     return h(
@@ -336,6 +379,7 @@ export function mountSettings(container) {
       'div',
       { class: 'card' },
       field('Show costs in', '1 AI credit = US$0.01 under GitHub Copilot usage-based billing. To cap spending, set a budget for Copilot on github.com.', select(settings.costUnit, [['credits', 'AI credits'], ['usd', 'US dollars']], (value) => save({ costUnit: value }))),
+      spendingLimit(settings),
       field('Thinking shown', 'Summarized shows a summary of the model\'s reasoning. Hidden saves screen space. Billing is the same.', select(settings.thinkingDisplay, [['summarized', 'Summarized'], ['omitted', 'Hidden']], (value) => save({ thinkingDisplay: value }))),
       field('Compact the conversation at', 'Percent of the model\'s context window. Claude and GPT then summarize the earlier messages themselves. For other models Caliope writes the summary. Each compaction restarts the prompt cache, but a larger conversation makes every request dearer.', h('div', { class: 'row' }, numberInput(settings.autoCompactPercent, 50, 95, (value) => save({ autoCompactPercent: value })), h('span', { class: 'muted' }, '%'))),
       field(
@@ -345,11 +389,28 @@ export function mountSettings(container) {
           'div',
           { class: 'row' },
           select(settings.compactModel, [[null, 'The session\'s model'], ...state.models.filter((model) => model.protocol && model.policyState !== 'disabled').map((model) => [model.id, model.name])], (value) => save({ compactModel: value || null })),
-          settings.compactModel ? select(settings.compactEffort, [[null, 'Session effort'], ['low', 'Low'], ['medium', 'Medium'], ['high', 'High']], (value) => save({ compactEffort: value || null })) : null,
+          settings.compactModel ? select(settings.compactEffort, [[null, 'Session effort'], ['low', 'Low'], ['medium', 'Medium'], ['high', 'High']], (value) => save({ compactEffort: value || null }), 'Summary effort') : null,
         ),
       ),
       field('Maximum output tokens', 'Per response, including thinking. Lower it only if responses are cut off for a reason.', numberInput(settings.maxOutputTokens, 1024, 128000, (value) => save({ maxOutputTokens: value }))),
     );
+  }
+
+  /** The monthly limit for all of Caliope: stored in AI credits, typed in the unit costs show in. */
+  function spendingLimit(settings) {
+    const dollars = settings.costUnit === 'usd';
+    const input = h('input', { class: 'input', type: 'number', min: '0', step: dollars ? '1' : '10', placeholder: 'No limit', value: settings.creditLimit ? String(dollars ? settings.creditLimit / 100 : settings.creditLimit) : '', style: { width: '140px' } });
+    input.addEventListener('change', () => {
+      const credits = Math.round(Number(input.value || 0) * (dollars ? 100 : 1));
+      if (credits >= 0) save({ creditLimit: credits });
+      else toast('Enter an amount of 0 or more, or leave it empty for no limit.', { kind: 'error' });
+    });
+    const limitField = field(
+      'Monthly spending limit',
+      'What all of Caliope may spend per calendar month. From 80% sessions show a notice, and at the limit the agent stops until you raise it. Each project can have its own limit on its project page. Requests Copilot reports no cost for are not counted. Empty: no limit.',
+      h('div', { class: 'row' }, input, h('span', { class: 'muted' }, dollars ? 'US$' : 'AI credits')),
+    );
+    return limitField;
   }
 
   function network(settings) {
@@ -426,6 +487,8 @@ export function mountSettings(container) {
       ),
       field('Check for updates', 'When Caliope starts and every 6 hours, it looks up the latest version on GitHub: one request without any data about you. Nothing installs until you click Update, unless the next setting is on.', toggle(settings.checkUpdates, (value) => save({ checkUpdates: value }))),
       field('Install updates automatically', 'When Caliope finds a new version, it installs it. The new version runs from the next start. Only for Caliope installed with the install line, not an unzipped copy.', toggle(settings.autoUpdate, (value) => save({ autoUpdate: value }))),
+      field('Keep running for scheduled tasks', 'Caliope starts when you sign in to Windows, without a window, and keeps running when you close the window, so scheduled tasks run on time. A task that waits for your answer opens the window.', toggle(settings.keepRunning, (value) => save({ keepRunning: value }))),
+      field('Commands and shortcuts', 'The / commands and the keyboard shortcuts. /help in a session shows them too.', h('button', { class: 'btn small', onClick: showHelp }, 'Show commands and shortcuts')),
       field('Data folder', 'Sessions, settings, the usage ledger and logs.', h('div', { class: 'stack' }, h('span', { class: 'mono', style: { fontSize: '12px', wordBreak: 'break-all' } }, state.boot.dataDir), h('button', { class: 'btn small', style: { alignSelf: 'flex-start' }, onClick: () => actions.openPath(state.boot.dataDir, false) }, h('span', { html: icon('folder-open', 13) }), 'Open'))),
       field(
         'Desktop shortcut',
@@ -446,7 +509,19 @@ export function mountSettings(container) {
     );
   }
 
-  subscriptions.push(on('settings', render), on('models', render), on('auth', render), on('update', render));
+  // A change of the models, the account or the version redraws only the sections that show it.
+  subscriptions.push(
+    on('settings', redraw),
+    on('models', () => {
+      if (section === 'models' || section === 'budget') redraw();
+    }),
+    on('auth', () => {
+      if (section === 'account' || section === 'models') redraw();
+    }),
+    on('update', () => {
+      if (section === 'app') redraw();
+    }),
+  );
   render();
 
   return {

@@ -3,7 +3,7 @@ import { h, clear, readImage, formatTokens, formatCost, debounce } from '../lib/
 import { icon } from '../lib/icons.js';
 import { api } from '../lib/api.js';
 import { state, modelById } from '../lib/store.js';
-import { openMenu, toastError } from './dialogs.js';
+import { openMenu, openModal, toastError } from './dialogs.js';
 
 export const MODES = [
   { id: 'ask', name: 'Ask permissions', short: 'Ask', icon: 'hand', description: 'Approve each file change and command.' },
@@ -38,6 +38,36 @@ export const SLASH_COMMANDS = [
 
 const MODE_CYCLE = ['ask', 'edits', 'auto', 'plan'];
 
+const SHORTCUTS = [
+  ['Enter / Shift+Enter', 'Send, or while the agent works queue it for when it is done / new line'],
+  ['Ctrl+Enter', 'While the agent works: send now, stopping what it is doing'],
+  ['Shift+Tab', 'Switch mode: Ask → Accept edits → Auto → Plan'],
+  ['Esc', 'Stop the agent'],
+  ['1 / 3', 'Allow / deny when the agent asks for permission. 1 to 9 pick an option of its question'],
+  ['Alt+1 / Alt+3', 'The same while you type in the message box or another text field'],
+  ['Ctrl+N', 'New session'],
+  ['Ctrl+K', 'Search sessions'],
+  ['Ctrl+B', 'Show or hide the sidebar'],
+  ['Ctrl+,', 'Settings'],
+  ['↑ / ↓', 'Move through the session list'],
+  ['@path', 'Attach a file to your message'],
+];
+
+/** The / commands and the keyboard shortcuts, from /help, the session's More menu and Settings. */
+export function showHelp() {
+  openModal({
+    title: 'Commands and shortcuts',
+    wide: true,
+    body: h(
+      'div',
+      { class: 'stack' },
+      h('table', { class: 'data-table' }, h('tbody', {}, SLASH_COMMANDS.map((command) => h('tr', {}, h('td', { class: 'mono' }, `/${command.name}${command.args ? ` ${command.args}` : ''}`), h('td', {}, command.description))))),
+      h('table', { class: 'data-table' }, h('tbody', {}, SHORTCUTS.map(([keys, text]) => h('tr', {}, h('td', {}, h('kbd', {}, keys)), h('td', {}, text))))),
+    ),
+    footer: (close) => h('button', { class: 'btn', type: 'button', onClick: () => close() }, 'Close'),
+  });
+}
+
 export class Composer {
   constructor(controller) {
     this.controller = controller;
@@ -46,15 +76,16 @@ export class Composer {
     this.popoverItems = [];
     this.popoverIndex = 0;
     this.popoverKind = null;
+    this.sending = false;
 
-    this.textarea = h('textarea', { rows: 1, placeholder: controller.placeholder || 'Message the agent… (/ for commands, @ to mention files)', 'aria-label': 'Message' });
+    this.textarea = h('textarea', { rows: 1, placeholder: controller.placeholder || 'Message the agent… (/ for commands, @ to mention files)', 'aria-label': 'Message', 'aria-autocomplete': 'list' });
     this.attachmentsElement = h('div', { class: 'composer-attachments', hidden: true });
     this.fileInput = h('input', { type: 'file', accept: 'image/png,image/jpeg,image/gif,image/webp', multiple: true, hidden: true });
     this.modeButton = h('button', { class: 'picker-btn', type: 'button' });
     this.modelButton = h('button', { class: 'picker-btn', type: 'button', title: 'Model for this session' });
     this.effortButton = h('button', { class: 'picker-btn', type: 'button', title: 'Reasoning effort: higher thinks longer and costs more' });
     this.contextElement = h('span', { class: 'context-ring' });
-    this.costElement = h('span', { class: 'context-ring' });
+    this.costElement = h('span', { class: 'context-ring composer-cost' });
     this.attachButton = h('button', { class: 'picker-btn', type: 'button', title: 'Attach images (or paste / drop them)', html: icon('paperclip', 15) });
     // While the agent works: Enter queues the message for when it is done, Ctrl+Enter ("Send now") stops the agent
     // and sends it, and Stop (Esc) only stops. While an approval or a question waits, a message always goes now.
@@ -239,26 +270,38 @@ export class Composer {
     return commands;
   }
 
+  /**
+   * Send the text and images, or run the / command.
+   * - The box clears at once and Enter does nothing until the send is done, so one message cannot go twice.
+   * - A send that fails puts the text and images back, before anything typed since.
+   * - When another session is open by then, the text goes back into the draft of the session it was written for.
+   *   Drafts keep text only, so the images are not put back.
+   */
   async submit({ interrupt = false } = {}) {
+    if (this.sending) return;
+    const sessionId = this.controller.sessionId();
     const text = this.textarea.value;
     if (!text.trim() && this.images.length === 0) return;
     const slash = /^\/([\w.:-]+)(?:\s+([\s\S]*))?$/.exec(text.trim());
     const command = slash && this.images.length === 0 ? this.slashCommands().find((item) => item.name === slash[1]) : null;
-    if (command && !command.sendAsMessage) {
-      const handled = await this.controller.onSlash(slash[1], (slash[2] || '').trim());
-      if (handled) {
-        this.setText('');
-        this.controller.onDraft?.('');
-        return;
+    const sentImages = this.images;
+    this.sending = true;
+    this.setText('');
+    this.controller.onDraft?.('');
+    try {
+      if (command && !command.sendAsMessage && (await this.controller.onSlash(slash[1], (slash[2] || '').trim()))) return;
+      const images = sentImages.map(({ mediaType, data }) => ({ mediaType, data }));
+      const ok = await this.controller.onSubmit(text, images, { interrupt });
+      if (!ok && this.controller.sessionId() === sessionId) {
+        const typed = this.textarea.value.trim();
+        const restored = typed ? `${text}\n\n${typed}` : text;
+        this.setText(restored, [...sentImages, ...this.images]);
+        this.controller.onDraft?.(restored);
+      } else if (!ok) {
+        this.controller.onDraft?.(text, sessionId);
       }
-    }
-    const images = this.images.map(({ mediaType, data }) => ({ mediaType, data }));
-    this.sendButton.disabled = true;
-    const ok = await this.controller.onSubmit(text, images, { interrupt });
-    if (ok) {
-      this.setText('');
-      this.controller.onDraft?.('');
-    } else {
+    } finally {
+      this.sending = false;
       this.updateSendButton();
     }
   }
@@ -394,8 +437,9 @@ export class Composer {
     this.popoverItems = items;
     this.popoverIndex = Math.min(this.popoverIndex, items.length - 1);
     if (!this.popover) {
-      this.popover = h('div', { class: 'popover', role: 'listbox' });
+      this.popover = h('div', { class: 'popover', role: 'listbox', id: 'composer-popover', 'aria-label': kind === 'slash' ? 'Commands' : 'Files' });
       this.element.append(this.popover);
+      this.textarea.setAttribute('aria-controls', 'composer-popover');
     }
     // Open on the side with more room: below the message box on the new-session page, near the top.
     const box = this.box.getBoundingClientRect();
@@ -407,14 +451,18 @@ export class Composer {
     this.renderPopover();
   }
 
+  /** The focus stays in the message box; screen readers follow the selected item through aria-activedescendant. */
   renderPopover() {
     clear(this.popover);
+    this.textarea.setAttribute('aria-activedescendant', `composer-option-${this.popoverIndex}`);
     this.popoverItems.forEach((item, index) => {
       const element = h(
         'div',
         {
           class: `popover-item${index === this.popoverIndex ? ' selected' : ''}`,
           role: 'option',
+          id: `composer-option-${index}`,
+          'aria-selected': String(index === this.popoverIndex),
           onMousedown: (event) => {
             event.preventDefault();
             this.choosePopoverItem(item);
@@ -451,6 +499,8 @@ export class Composer {
   closePopover() {
     this.popover?.remove();
     this.popover = null;
+    this.textarea.removeAttribute('aria-activedescendant');
+    this.textarea.removeAttribute('aria-controls');
     this.popoverItems = [];
     this.popoverIndex = 0;
   }
@@ -482,12 +532,13 @@ export class Composer {
     }
     const defaults = state.modelDefaults || {};
     const items = [{ section: 'Recommended' }];
+    // Shortcuts to models the list below has too. Only the list marks the current model, so one choice is on.
     for (const [role, label] of [
       ['plan', 'for planning'],
       ['build', 'for building'],
     ]) {
       const model = modelById(defaults[role]);
-      if (model) items.push({ label: model.name, hint: label, icon: role === 'plan' ? 'map' : 'pencil', checked: model.id === current, onSelect: () => this.controller.setModel(model.id) });
+      if (model) items.push({ label: model.name, hint: label, icon: role === 'plan' ? 'map' : 'pencil', onSelect: () => this.controller.setModel(model.id) });
     }
     const vendors = new Map();
     for (const model of models) {
@@ -501,7 +552,8 @@ export class Composer {
         const unavailable = model.policyState === 'disabled';
         // Copilot's list has no prices (its multiplier is 1× for every model), so show what requests cost the user so far.
         const cost = state.modelCosts?.[model.id];
-        const costText = cost ? (cost.nanoPerRequest === 0 ? 'free' : `≈ ${formatCost(cost.nanoPerRequest, state.settings?.costUnit)} / request`) : null;
+        const average = cost ? formatCost(cost.nanoPerRequest, state.settings?.costUnit) : null;
+        const costText = cost ? (cost.nanoPerRequest === 0 ? 'free' : `${average.startsWith('<') ? '' : '≈ '}${average} / request`) : null;
         const details = [model.maxPromptTokens ? `${formatTokens(model.maxPromptTokens)} ctx` : null, costText].filter(Boolean).join(' · ');
         items.push({
           label: model.name + (model.preview ? ' (preview)' : ''),

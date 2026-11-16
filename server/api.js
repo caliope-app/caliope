@@ -10,14 +10,14 @@ import { ToolInputError } from './tools/fs-tools.js';
 import { listProjectFiles, gitBranch, gitRoot, projectRoot } from './tools/files.js';
 import { discoverSkills, publicSkill } from './skills.js';
 import { sessionChanges, sessionToMarkdown } from './session-files.js';
-import { pickFolder, revealInExplorer, openWithDefaultApp, openUrl, runPowerShell, agentBrowser, remoteDebuggingBlocked } from './windows.js';
+import { revealInExplorer, openWithDefaultApp, openUrl, runPowerShell, agentBrowser, remoteDebuggingBlocked } from './windows.js';
 import { isInside, pathKey } from './tools/paths.js';
 import { promptContent } from './conversation.js';
 import { usableModels } from './models.js';
 import { REVIEW_PROMPT, INIT_PROMPT, COMMIT_PROMPT, PULL_REQUEST_PROMPT, PROJECT_INSTRUCTION_FILES } from './prompts.js';
 import { gitChanges, removeWorktree } from './git.js';
 import { discoverCommands } from './commands.js';
-import { isAbortError, sleep } from './util.js';
+import { sleep } from './util.js';
 import { validateHooks } from './hooks.js';
 import { profileForFolder } from './tools/browser.js';
 import { projectFolderOf } from './projects.js';
@@ -114,6 +114,8 @@ export function createRoutes({ config, settings, store, client, auth, agents, le
       allowance: agents.allowanceState(),
       update: updates.status,
       saveErrors: Object.fromEntries(store.saveErrors),
+      // No settings file when Caliope started, and no default mode chosen since: the window asks for one.
+      firstRun: settings.firstRun,
     })),
 
     // Sessions
@@ -121,8 +123,12 @@ export function createRoutes({ config, settings, store, client, auth, agents, le
       guard(async () => {
         const cwd = validFolder(body.cwd);
         if (body.mode && !MODES.includes(body.mode)) throw new HttpError(400, 'Unknown mode.');
+        if (body.effort && !EFFORTS.includes(body.effort)) throw new HttpError(400, 'Unknown effort level.');
         const trust = typeof body.trust === 'boolean' ? body.trust : undefined;
-        const session = await agents.createSession({ cwd, mode: body.mode, worktree: Boolean(body.worktree), trust });
+        // The model and effort picked on the new-session page. Without them, or with a model that is not text,
+        // the session gets the defaults.
+        const model = (typeof body.model === 'string' && body.model) || null;
+        const session = await agents.createSession({ cwd, mode: body.mode, worktree: Boolean(body.worktree), trust, model, effort: body.effort || null });
         return sessionPayload(session);
       }),
     ),
@@ -146,7 +152,9 @@ export function createRoutes({ config, settings, store, client, auth, agents, le
         }
         if (body.model !== undefined || body.effort !== undefined) {
           if (body.effort !== undefined && body.effort !== null && !EFFORTS.includes(body.effort)) throw new HttpError(400, 'Unknown effort level.');
-          await agents.changeModel(session, body.model || null, body.effort);
+          // A model that is not text keeps the session's model.
+          const model = (typeof body.model === 'string' && body.model) || null;
+          await agents.changeModel(session, model, body.effort);
         }
         await store.save(session.meta.id);
         agents.broadcastMeta(session);
@@ -294,24 +302,8 @@ export function createRoutes({ config, settings, store, client, auth, agents, le
         const session = await requireSession(params.id);
         const runner = agents.runner(params.id);
         if (runner.state === 'running') throw new HttpError(409, 'Wait for the current turn to finish, or stop it, before compacting.');
-        runner.state = 'running';
-        runner.abortController = new AbortController();
-        runner.setStatus('compacting');
-        let stopped = false;
-        try {
-          await agents.compact(session, { instructions: String(body.instructions || ''), reason: 'Compacted on request.', signal: runner.abortController.signal });
-        } catch (error) {
-          // Esc, or "interrupt and send", stops the compaction. That is not a failure.
-          if (!isAbortError(error) && !runner.abortController.signal.aborted) throw error;
-          stopped = true;
-        } finally {
-          runner.state = 'idle';
-          runner.abortController = null;
-          runner.setStatus(null);
-          // The message that interrupted the compaction, or one sent while it ran, starts a turn now.
-          runner.startNext(session);
-        }
-        return { ok: !stopped, stopped };
+        const outcome = await runner.compact(session, String(body.instructions || ''));
+        return outcome;
       }),
     ),
     route('GET', '/api/sessions/:id/changes', async ({ params }) => {
@@ -391,10 +383,6 @@ export function createRoutes({ config, settings, store, client, auth, agents, le
       }
       return { files: rankFiles(cached.files, query.get('q') || '') };
     }),
-    route('POST', '/api/pick-folder', async ({ body }) => {
-      const picked = await pickFolder(body.initial || '');
-      return { path: picked };
-    }),
     route('POST', '/api/open', async ({ body }) => {
       const target = path.resolve(String(body.path || ''));
       if (!fs.existsSync(target)) throw new HttpError(404, 'That path does not exist.');
@@ -438,10 +426,29 @@ export function createRoutes({ config, settings, store, client, auth, agents, le
       const { tools, errors } = await agents.mcp.toolsFor({ servers: { [body.name]: server }, cwd: os.homedir(), extraPath: settings.effectiveExtraPath() });
       return { tools: tools.map(({ tool, readOnly }) => ({ tool, readOnly })), errors };
     }),
+    // Sign in to an HTTP MCP server from Settings with OAuth (Settings → MCP servers → Sign in). The server's sign-in
+    // page opens in the browser; the answer comes when the browser returns, or after 5 minutes.
+    route('POST', '/api/mcp/sign-in', async ({ body }) => {
+      const server = settings.get().mcpServers[body?.name];
+      if (!server?.url) throw new HttpError(404, 'There is no HTTP MCP server with that name in Settings.');
+      // Why the sign-in could not be saved, or null: it then lasts until Caliope closes.
+      let saveFailed;
+      try {
+        const openSignInPage = (url) => {
+          if (!config.noBrowser) openUrl(url, settings.get().browser);
+        };
+        saveFailed = await agents.mcp.signIn({ name: body.name, server, openUrl: openSignInPage });
+      } catch (error) {
+        throw new HttpError(400, error.message);
+      }
+      return { signedIn: true, saveFailed };
+    }),
     route('GET', '/api/models', async ({ query }) =>
       guard(async () => {
         if (query.get('refresh') === '1') {
           await client.refreshModels();
+          // The user's refresh also forgets the optional fields Copilot refused, so each model tries them again.
+          await client.clearAdaptations();
           agents.hub.broadcast({ type: 'models', ...modelsPayload() });
         }
         return modelsPayload();
@@ -465,9 +472,22 @@ export function createRoutes({ config, settings, store, client, auth, agents, le
       const summary = ledger.summary({ since });
       const sessions = summary.bySession.map((entry) => {
         const meta = store.getMeta(entry.sessionId);
-        return { ...entry, title: meta ? meta.title : 'Deleted session', cwd: meta?.cwd || null, exists: Boolean(meta) };
+        return { ...entry, title: meta ? meta.title : 'Deleted session', cwd: meta?.cwd || null, project: meta ? projectFolderOf(meta) : null, exists: Boolean(meta) };
       });
-      return { period, since, ...summary, bySession: sessions, allowance: agents.allowanceState() };
+      // Each project's spending in the period, with its monthly limit and what it spent this calendar month.
+      // The ledger keys projects in lower case. The folder as written comes from the projects and sessions.
+      const folders = new Map();
+      for (const meta of store.allMetas()) folders.set(pathKey(projectFolderOf(meta)), projectFolderOf(meta));
+      for (const project of projects.saved()) folders.set(pathKey(project.folder), project.folder);
+      const projectRows = summary.byProject.map((entry) => {
+        const project = projects.get(folders.get(entry.project) || entry.project);
+        const projectMonth = ledger.spendThisMonth(entry.project);
+        return { ...entry, folder: project.folder, name: project.name, creditLimit: project.creditLimit, spentThisMonth: projectMonth.nanoAiu, unpricedThisMonth: projectMonth.unpricedRequests };
+      });
+      // This calendar month for all of Caliope, whatever the period: what the limit in Settings counts.
+      // `unpricedThisMonth` > 0 means that limit cannot be fully enforced.
+      const month = ledger.spendThisMonth();
+      return { period, since, ...summary, bySession: sessions, byProject: projectRows, allowance: agents.allowanceState(), spentThisMonth: month.nanoAiu, unpricedThisMonth: month.unpricedRequests };
     }),
     route('GET', '/api/allowance', async ({ query }) => agents.refreshAllowance({ force: query.get('refresh') === '1' })),
 
@@ -547,8 +567,9 @@ export function createRoutes({ config, settings, store, client, auth, agents, le
       const skills = await discoverSkills({ projectRoot: project.trusted === true ? root : null, dataDir: config.dataDir, settings: settings.get() });
       const instructionFiles = [...PROJECT_INSTRUCTION_FILES, path.join('.github', 'copilot-instructions.md')].filter((name) => fs.existsSync(path.join(root, name)));
       const projectFiles = await agents.projectFilesIn(folder);
-      const spentThisMonth = ledger.projectSpendThisMonth(pathKey(folder));
-      return { project, root, branch, skills: skills.map(publicSkill), instructionFiles, projectFiles, spentThisMonth };
+      // `unpricedThisMonth` > 0 means the project's limit cannot be fully enforced.
+      const month = ledger.spendThisMonth(pathKey(folder));
+      return { project, root, branch, skills: skills.map(publicSkill), instructionFiles, projectFiles, spentThisMonth: month.nanoAiu, unpricedThisMonth: month.unpricedRequests };
     }),
     route('PUT', '/api/project', async ({ body }) => {
       const folder = validFolder(body.folder);
@@ -678,8 +699,9 @@ export function createRoutes({ config, settings, store, client, auth, agents, le
     route('POST', '/api/update/check', async () => updates.check()),
     route('POST', '/api/update/install', async () => {
       if (!updates.installed) throw new HttpError(400, `This copy of Caliope was unzipped by hand. Download the new version from ${updates.status.downloadUrl} and unzip it to a new folder.`);
-      updates.install();
-      return { ok: true };
+      // Waits for the download and its checks, so the window can show why an update failed.
+      const version = await updates.install();
+      return { ok: true, version };
     }),
 
     // Windows integration

@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { diffLines, diffTexts, splitLines, buildHunks } from '../shared/diff.js';
 import { createSseParser } from '../server/sse-parser.js';
+import { EventHub } from '../server/hub.js';
 import { createGlobMatcher, globToRegExp } from '../server/tools/glob.js';
 
 function applyOps(oldLines, newLines, ops) {
@@ -72,6 +73,19 @@ test('SSE parser handles events split at every position and all line endings', (
       { event: 'b', data: '[DONE]' },
     ]);
   }
+});
+
+test('the event hub closes a window that fell more than 16 MB behind, and keeps sending to the others', () => {
+  const window = (writableLength) => ({ writableLength, frames: [], destroyed: false, on() {}, write(frame) { this.frames.push(frame); }, destroy() { this.destroyed = true; } });
+  const hub = new EventHub();
+  const behind = window(16 * 1024 * 1024 + 1);
+  const current = window(0);
+  hub.add(behind);
+  hub.add(current);
+  hub.broadcast({ type: 'models' });
+  hub.heartbeat();
+  assert.deepEqual([behind.destroyed, behind.frames], [true, []]);
+  assert.deepEqual([current.destroyed, current.frames], [false, ['data: {"type":"models"}\n\n', ': keep-alive\n\n']]);
 });
 
 test('glob patterns', () => {

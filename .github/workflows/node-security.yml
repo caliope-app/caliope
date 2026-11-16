@@ -1,15 +1,27 @@
 # Once a day: when Node.js has a security release newer than the Node.js in the latest Caliope release, publishes
 # a new patch version through release.yml, with the same tests and checks. Installed copies see it in their
 # update check. A failed run publishes nothing, and the next day's run tries again.
+# Run it by hand with dry_run to go through the version commit, the tag, the signing and the publish steps without
+# pushing or publishing anything, also when Node.js has no new security release.
 name: Node.js security
 
 on:
   schedule:
     - cron: '30 6 * * *'
   workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Go through every step, but push and publish nothing
+        type: boolean
+        default: false
 
 permissions:
   contents: read
+
+# A run waits for the one before it, which may publish the version this one would.
+concurrency:
+  group: node-security
+  cancel-in-progress: false
 
 jobs:
   check:
@@ -19,6 +31,8 @@ jobs:
     steps:
       - name: Compare with nodejs.org
         id: compare
+        env:
+          DRY_RUN: ${{ inputs.dry_run }}
         run: |
           node --input-type=module >> "$GITHUB_OUTPUT" <<'EOF'
           const manifest = await (await fetch(`https://github.com/${process.env.GITHUB_REPOSITORY}/releases/latest/download/manifest.json`)).json();
@@ -26,7 +40,9 @@ jobs:
           // Newest first. A new major version stays a choice of its own.
           const sameMajor = releases.filter(({ version }) => version.startsWith(`v${String(manifest.node).split('.')[0]}.`));
           const newer = sameMajor.slice(0, sameMajor.findIndex(({ version }) => version === `v${manifest.node}`));
-          console.log(`node=${newer.some(({ security }) => security) ? newer[0].version.slice(1) : ''}`);
+          // A dry run goes on also without a security release, with the newest Node.js of the same major version.
+          const node = newer.some(({ security }) => security) || process.env.DRY_RUN === 'true' ? sameMajor[0].version.slice(1) : '';
+          console.log(`node=${node}`);
           EOF
 
   release:
@@ -34,6 +50,11 @@ jobs:
     if: needs.check.outputs.node
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     uses: ./.github/workflows/release.yml
     with:
       node: ${{ needs.check.outputs.node }}
+      dry_run: ${{ inputs.dry_run == true }}
+    secrets:
+      CALIOPE_SIGNING_KEY: ${{ secrets.CALIOPE_SIGNING_KEY }}

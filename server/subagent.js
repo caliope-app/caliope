@@ -3,15 +3,13 @@
 // through the session's approvals, their file changes are rewound with the message that started them,
 // and their requests count towards the session's spending.
 import { isAbortError, abortError } from './util.js';
-import { getTool, toolSpecsFor, validateToolInput } from './tools/index.js';
-import { ToolInputError } from './tools/fs-tools.js';
+import { getTool, toolSpecsFor } from './tools/index.js';
 import { projectRoot } from './tools/files.js';
-import { loadSkill } from './skills.js';
 import { effortFor, matchModel, usableModels } from './models.js';
 import { subagentSystemPrompt, loadInstructions } from './prompts.js';
 import { estimateContextTokens } from './conversation.js';
-import { streamModelRequest, errorResult, toolResultBlock } from './turn-helpers.js';
-import { authorize, refusedBeforePrepare } from './permissions.js';
+import { streamModelRequest, errorResult } from './turn-helpers.js';
+import { effectiveShell } from './tools/shell.js';
 
 const READ_TOOLS = ['read_file', 'list_dir', 'glob', 'grep'];
 // Web research runs on the session's model: in a replay the small model fetched wrong addresses of an API
@@ -51,7 +49,9 @@ export async function runSubagent({ runner, session, assistant, input, signal, p
   const tools = toolSpecsFor(toolNames);
   const extraPath = manager.settings.effectiveExtraPath();
   const instructions = await loadInstructions({ cwd: session.meta.cwd, root: await projectRoot(session.meta.cwd, extraPath), settings, includeProject: manager.projectTrusted(session.meta) });
-  const system = subagentSystemPrompt({ cwd: session.meta.cwd, shell: settings.shell, write, web, instructions, skills });
+  // The shell the commands really run in: cmd.exe also in Constrained Language Mode.
+  const shell = await effectiveShell(settings.shell);
+  const system = subagentSystemPrompt({ cwd: session.meta.cwd, shell, write, web, instructions, skills });
   const effort = effortFor(model, input.effort || (explore ? 'low' : settings.subagentEffort));
   const maxTokens = Math.min(settings.maxOutputTokens, model.maxOutputTokens || settings.maxOutputTokens);
   const label = `${input.description || 'Subagent'} (${model.name})`;
@@ -59,6 +59,8 @@ export async function runSubagent({ runner, session, assistant, input, signal, p
 
   const history = [{ role: 'user', content: [{ type: 'text', text: String(input.prompt) }] }];
   const trace = [];
+  // Subfolders whose instruction files this subagent got with a tool result (see withFolderInstructions).
+  const instructionFolders = [];
   let steps = 0;
   let spentNano = 0;
   let unpriced = 0;
@@ -84,6 +86,7 @@ export async function runSubagent({ runner, session, assistant, input, signal, p
           return { request: { model, system, tools, history, effort, maxTokens, thinkingDisplay: 'omitted' } };
         },
         onUnfinished: (usage) => manager.recordUsage(session, model, usage, 'subagent'),
+        onNotice: (text) => manager.appendEvent(session, { kind: 'notice', text }),
       });
       steps++;
       manager.recordUsage(session, model, result.usage, 'subagent');
@@ -112,7 +115,7 @@ export async function runSubagent({ runner, session, assistant, input, signal, p
           continue;
         }
         progress(`${toolUse.name} ${describeInput(toolUse.input)}`.trim());
-        const outcome = await runTool({ runner, session, assistant, toolUse, toolNames, signal, label });
+        const outcome = await runTool({ runner, session, assistant, toolUse, toolNames, signal, label, instructionFolders });
         results.push(outcome.block);
         if (trace.length < MAX_TRACE) trace.push({ tool: toolUse.name, target: describeInput(toolUse.input), error: Boolean(outcome.block.is_error) });
         if (outcome.stopTurn) ending = { stopTurn: true, report: lastText };
@@ -137,34 +140,15 @@ export async function runSubagent({ runner, session, assistant, input, signal, p
   return { content: `${report}\n\n${footer}`, meta: { ...meta, report } };
 }
 
-/** One tool call of a subagent, with the same checks and approvals as the main agent's. */
-async function runTool({ runner, session, assistant, toolUse, toolNames, signal, label }) {
+/**
+ * One tool call of a subagent, with the same checks and approvals as the main agent's (see runToolCall).
+ * - Only the tools of this subagent's list run.
+ * - `instructionFolders`: the subagent's own list, so the main agent still gets those instruction files itself.
+ */
+async function runTool({ runner, session, assistant, toolUse, toolNames, signal, label, instructionFolders }) {
   if (!toolNames.includes(toolUse.name)) return { block: errorResult(toolUse, `There is no tool named "${toolUse.name}" for this subagent.`) };
-  if (toolUse.invalidJson !== undefined) return { block: errorResult(toolUse, 'The tool input was not valid JSON (it may have been cut off). Try again with smaller input.') };
-  const tool = getTool(toolUse.name);
-  const problem = validateToolInput(tool, toolUse.input);
-  if (problem) return { block: errorResult(toolUse, problem) };
-  try {
-    if (tool.name === 'use_skill') {
-      const skill = await runner.findSkill(session, toolUse.input.name);
-      if (!skill) return { block: errorResult(toolUse, `There is no skill named "${toolUse.input.name}".`) };
-      const instructions = await loadSkill(skill);
-      const block = toolResultBlock(toolUse, { content: instructions });
-      return { block };
-    }
-    const ctx = runner.toolContext(session, assistant, toolUse, signal);
-    const refusal = refusedBeforePrepare(runner.manager, session, tool, toolUse.input);
-    if (refusal) return { block: errorResult(toolUse, refusal, { denied: true }) };
-    const prepared = tool.prepare ? await tool.prepare(toolUse.input, ctx) : null;
-    const decision = await authorize(runner, session, tool, toolUse, prepared, signal, ctx, label);
-    if (!decision.allowed) return { block: errorResult(toolUse, decision.message, { denied: true }), stopTurn: decision.stopTurn };
-    const result = await runner.runWithHooks(session, tool, toolUse, ctx, prepared);
-    return { block: toolResultBlock(toolUse, result) };
-  } catch (error) {
-    if (signal.aborted || isAbortError(error)) throw error;
-    if (error instanceof ToolInputError) return { block: errorResult(toolUse, error.message) };
-    return { block: errorResult(toolUse, `The tool failed: ${error.message}`) };
-  }
+  const outcome = await runner.runToolCall(session, assistant, getTool(toolUse.name), toolUse, signal, { label, instructionFolders });
+  return outcome;
 }
 
 /** A few words about a tool call for the progress lines and the trace. */

@@ -1,13 +1,14 @@
 // Caliope server entry point.
-//   node server/main.js --open    start (or reuse) the server and open the app window
-//   node server/main.js --stay    keep running without a window (for development)
+//   node server/main.js --open        start (or reuse) the server and open the app window
+//   node server/main.js --background  start (or reuse) the server without a window (the Startup entry)
+//   node server/main.js --stay        keep running without a window (for development)
 import fs from 'node:fs';
 import net from 'node:net';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { loadConfig, APP_NAME, APP_VERSION } from './config.js';
+import { loadConfig, APP_NAME, APP_VERSION, RELEASE_PUBLIC_KEY } from './config.js';
 import { createLogger, readJson, writeJsonAtomic, sleep } from './util.js';
 import { SettingsStore } from './settings.js';
 import { AuthManager } from './auth.js';
@@ -18,7 +19,7 @@ import { EventHub } from './hub.js';
 import { AgentManager } from './agent.js';
 import { createRoutes } from './api.js';
 import { createAppServer } from './http.js';
-import { openAppWindow, isProcessAlive, runPowerShell } from './windows.js';
+import { openAppWindow, isProcessAlive, showErrorBox, removeDownloadMarks, setStartAtSignIn } from './windows.js';
 import { AgentBrowser } from './tools/browser.js';
 import { ProjectStore } from './projects.js';
 import { McpHub } from './mcp.js';
@@ -48,6 +49,12 @@ async function main() {
   const log = createLogger(config.logsDir);
   process.on('unhandledRejection', (error) => log.error('Unhandled rejection.', error));
   process.on('uncaughtException', (error) => log.error('Uncaught exception.', error));
+  // Once, after the zip was unzipped by hand. A mark that stays only brings Windows' warning back.
+  try {
+    removeDownloadMarks(config.appRoot);
+  } catch (error) {
+    log.warn('Could not remove the "from the internet" mark from Caliope\'s files.', error.message);
+  }
 
   const serverFile = path.join(config.dataDir, 'server.json');
   const settings = new SettingsStore(path.join(config.dataDir, 'settings.json'), log);
@@ -66,32 +73,51 @@ async function main() {
   // Two starts at once (a double-click) must not both become servers: they would overwrite each other's sessions.
   let lock = await lockDataDir(config.dataDir);
   let running = await findRunningInstance(serverFile);
-  if (!lock) {
-    // Another start holds the data folder: wait until its server answers.
-    for (let waited = 0; !running && waited < 20000; waited += 250) {
-      await sleep(250);
-      running = await findRunningInstance(serverFile);
+  const openWindowOn = async (instance) => {
+    const token = await requestLaunchToken(instance.port, instance.secret);
+    openAppWindow(`http://127.0.0.1:${instance.port}/auth?token=${token}`, settings.get().browser, path.join(config.dataDir, 'app-window'));
+  };
+  let openedOnBusy = false;
+  for (;;) {
+    if (!lock) {
+      // Another start holds the data folder: wait until its server answers.
+      for (let waited = 0; !running && waited < 20000; waited += 250) {
+        await sleep(250);
+        running = await findRunningInstance(serverFile);
+      }
+      if (!running) throw new Error(`Another ${APP_NAME} is starting with the same data folder and did not answer. Wait a moment and start ${APP_NAME} again.`);
     }
-    if (!running) throw new Error(`Another ${APP_NAME} is starting with the same data folder and did not answer. Wait a moment and start ${APP_NAME} again.`);
-  }
-  if (running && running.version !== APP_VERSION) {
-    // An update was installed while the old version runs: stop it, then start this one.
-    log.info(`Stopping ${APP_NAME} ${running.version} on port ${running.port} to start ${APP_VERSION}.`);
-    await stopRunningInstance(running);
-    running = null;
-    // Its hold on the data folder ends with its process.
-    for (let waited = 0; !lock && waited < 15000; waited += 250) {
-      lock = await lockDataDir(config.dataDir);
-      if (!lock) await sleep(250);
+    if (!running || running.version === APP_VERSION) break;
+    // Another version runs, because an update was installed meanwhile. It stops for this one, unless a turn, a
+    // question or a background command still runs there: then the window opens on it, and this start waits.
+    if (await stopRunningInstance(running)) {
+      log.info(`Stopped ${APP_NAME} ${running.version} on port ${running.port} to start ${APP_VERSION}.`);
+      running = null;
+      // Its hold on the data folder ends with its process.
+      for (let waited = 0; !lock && waited < 15000; waited += 250) {
+        lock = await lockDataDir(config.dataDir);
+        if (!lock) await sleep(250);
+      }
+      // Still held: another start that waited as well took over. The loop then uses its server.
+      if (!lock) running = await findRunningInstance(serverFile);
+      continue;
     }
-    if (!lock) throw new Error(`Another ${APP_NAME} still uses the data folder ${config.dataDir}. Close it from the Task Manager (node.exe) and start ${APP_NAME} again.`);
+    if (config.open && !openedOnBusy) {
+      log.info(`${APP_NAME} ${running.version} on port ${running.port} is busy; ${APP_VERSION} starts once it is done.`);
+      await openWindowOn(running);
+      openedOnBusy = true;
+    }
+    await sleep(5000);
+    // The other version may have been closed meanwhile.
+    lock = await lockDataDir(config.dataDir);
+    running = await findRunningInstance(serverFile);
   }
   if (running) {
+    // This start waited for the busy other version and opened a window on it. Another start that waited too became
+    // the server of this version, and that one opens the window.
+    if (openedOnBusy) return;
     log.info(`Server already running on port ${running.port}; opening a window.`);
-    if (config.open) {
-      const token = await requestLaunchToken(running.port, running.secret);
-      openAppWindow(`http://127.0.0.1:${running.port}/auth?token=${token}`, settings.get().browser, path.join(config.dataDir, 'app-window'));
-    }
+    if (config.open) await openWindowOn(running);
     return;
   }
 
@@ -113,23 +139,54 @@ async function main() {
   await store.init();
   const ledger = new UsageLedger({ file: path.join(config.dataDir, 'usage.jsonl'), log });
   await ledger.init();
-  const projects = new ProjectStore(path.join(config.dataDir, 'projects.json'));
+  const projects = new ProjectStore(path.join(config.dataDir, 'projects.json'), log);
   await projects.load();
   fs.mkdirSync(path.join(config.dataDir, 'skills'), { recursive: true });
   const browser = new AgentBrowser({ dataDir: config.dataDir, getChoice: () => settings.get().browser, log, headless: config.browserHeadless });
-  const mcp = new McpHub({ log });
+  // OAuth sign-ins of HTTP MCP servers live next to the settings, encrypted, never in settings.json.
+  const mcp = new McpHub({ log, signInFile: path.join(config.dataDir, 'mcp-auth.json'), plainSecrets: config.plainSecrets });
   // MCP servers keep the proxy they started with: after a change they stop, and start again when needed.
+  // A server removed from Settings, or given another address, is signed out: its tokens leave mcp-auth.json.
+  let mcpServers = settings.get().mcpServers;
   settings.onChange((values) => {
     if (useProxy(values)) mcp.closeAll();
+    const addresses = new Set(Object.values(values.mcpServers).map((server) => server.url));
+    for (const server of Object.values(mcpServers)) {
+      if (server.url && !addresses.has(server.url)) mcp.signIns.remove(server.url).catch((error) => log.warn(`Could not remove the MCP sign-in for ${server.url}.`, error.message));
+    }
+    mcpServers = values.mcpServers;
   });
   const agents = new AgentManager({ config, settings, store, client, auth, hub, log, ledger, browser, mcp, projects });
   // install.ps1 puts a launcher next to the version folders. A copy unzipped by hand has none.
-  const installed = fs.existsSync(path.join(config.appRoot, '..', 'Caliope.cmd'));
-  const updates = new UpdateChecker({ releasesUrl: config.releasesUrl, currentVersion: APP_VERSION, installed, hub, log });
+  const installRoot = path.resolve(config.appRoot, '..');
+  const installed = fs.existsSync(path.join(installRoot, 'Caliope.cmd'));
+  const updates = new UpdateChecker({ releasesUrl: config.releasesUrl, currentVersion: APP_VERSION, installed, root: installRoot, publicKey: RELEASE_PUBLIC_KEY, isBusy: () => agents.isBusy(), hub, log });
+  // "Keep running for scheduled tasks" starts Caliope at sign-in, through the launcher that survives updates.
+  // With the setting on, every start writes the entry again, so it follows a write that failed and starts this copy's
+  // launcher. A start never removes it: a start with another data folder (CALIOPE_DATA_DIR, the tests) has the
+  // setting off and would remove the user's entry. Turning the setting off removes it, and so does the uninstall.
+  // A failure only goes to the log: the setting itself is saved.
+  const launcher = path.join(installed ? installRoot : config.appRoot, 'Caliope.cmd');
+  let keepRunning = settings.get().keepRunning;
+  const updateStartupEntry = () => {
+    try {
+      setStartAtSignIn(keepRunning, launcher);
+    } catch (error) {
+      log.warn(`Could not ${keepRunning ? 'add' : 'remove'} the Startup entry that starts ${APP_NAME} at sign-in.`, error.message);
+    }
+  };
+  if (keepRunning) updateStartupEntry();
+  settings.onChange((values) => {
+    if (values.keepRunning === keepRunning) return;
+    keepRunning = values.keepRunning;
+    updateStartupEntry();
+  });
   const scheduler = new Scheduler({ agents, projects, hub, log });
   const routes = createRoutes({ config, settings, store, client, auth, agents, ledger, log, projects, updates, scheduler });
-  const app = createAppServer({ config, secret, routes, hub, log, onShutdown: (reason) => shutdown(reason === 'update' ? `a newer version of ${APP_NAME} started` : 'asked to stop', reason) });
+  const app = createAppServer({ config, secret, routes, hub, log, isBusy: () => agents.isBusy(), onShutdown: (reason) => shutdown(reason === 'update' ? `a newer version of ${APP_NAME} started` : 'asked to stop', reason) });
   const port = await app.listen(config.port);
+  // From here config.port is the port in use: the agent's browser and web_fetch may not open it (see authorize).
+  config.port = port;
   await writeJsonAtomic(serverFile, { pid: process.pid, port, secret, version: APP_VERSION, startedAt: new Date().toISOString() });
   log.info(`${APP_NAME} ${APP_VERSION} listening on http://127.0.0.1:${port} (data: ${config.dataDir}).`);
   if (process.env.CALIOPE_PRINT_URL === '1') process.stdout.write(`URL http://127.0.0.1:${port}/auth?token=${app.createLaunchToken()}\n`);
@@ -147,12 +204,23 @@ async function main() {
   const checkForUpdates = async () => {
     if (!settings.get().checkUpdates) return;
     const status = await updates.check();
-    // A copy unzipped by hand can't update itself. The new version only installs: starting it would stop this
-    // one, also a turn the user started meanwhile. It runs from the next start.
+    // A copy unzipped by hand can't update itself. The new version only installs and runs from the next start:
+    // switching now would close the window the user works in.
     if (settings.get().autoUpdate && status.available && status.installed && status.latest !== installedInBackground) {
       installedInBackground = status.latest;
       log.info(`Installing ${APP_NAME} ${status.latest} for the next start (Install updates automatically is on).`);
-      updates.install({ start: false });
+      updates
+        .install({ start: false })
+        .then(() => {
+          // "Keep running for scheduled tasks" never closes this version, so the next start would be the next
+          // sign-in. The new version starts without a window instead, once nothing runs here and no window is open.
+          if (settings.get().keepRunning) updates.startWhenIdle({ background: true });
+        })
+        .catch((error) => {
+          // The next check tries again.
+          installedInBackground = null;
+          log.warn('The automatic update failed.', error.message);
+        });
     }
   };
   checkForUpdates();
@@ -174,6 +242,8 @@ async function main() {
     const deadline = Date.now() + 5000;
     while ([...agents.runners.values()].some((runner) => runner.state === 'running') && Date.now() < deadline) await sleep(100);
     await store.flush();
+    // The last usage lines, also those of the turns stopped just now.
+    await ledger.flush();
     await browser.shutdown().catch(() => {});
     mcp.closeAll();
     try {
@@ -190,14 +260,26 @@ async function main() {
 
   if (!config.stay) {
     // Close when no window has been connected for a while, no turn is working or waiting for the user,
-    // and no background command runs.
+    // and no background command runs. "Keep running for scheduled tasks" keeps Caliope running for the next task.
     setInterval(() => {
-      if (hub.clientCount === 0 && !agents.isBusy() && Date.now() - hub.lastClientAt > IDLE_SHUTDOWN_MS) shutdown('no window open');
+      if (hub.clientCount === 0 && !agents.isBusy() && !settings.get().keepRunning && Date.now() - hub.lastClientAt > IDLE_SHUTDOWN_MS) shutdown('no window open');
+    }, 5000);
+  }
+
+  const openWindow = () => openAppWindow(`http://127.0.0.1:${port}/auth?token=${app.createLaunchToken()}`, settings.get().browser, path.join(config.dataDir, 'app-window'));
+  if (!config.noBrowser) {
+    // A question while no window is open, such as an approval for a scheduled task in Ask mode, opens the app
+    // window: only an open window shows it and its notification. Once per question.
+    const shownQuestions = new Set();
+    setInterval(() => {
+      const unseen = [...agents.runners.values()].map((runner) => runner.waiting?.id).filter((id) => id && !shownQuestions.has(id));
+      for (const id of unseen) shownQuestions.add(id);
+      if (unseen.length > 0 && hub.clientCount === 0) openWindow();
     }, 5000);
   }
 
   if (config.open) {
-    const browser = openAppWindow(`http://127.0.0.1:${port}/auth?token=${app.createLaunchToken()}`, settings.get().browser, path.join(config.dataDir, 'app-window'));
+    const browser = openWindow();
     log.info(`Opened the app window with ${browser}.`);
   }
 }
@@ -238,15 +320,18 @@ async function findRunningInstance(serverFile) {
 }
 
 /**
- * Ask a running older version to stop (it finishes saving first), and wait until its process is gone.
- * - Throws when it keeps running: two servers must never share the sessions and settings.
+ * Ask a running other version to stop (it finishes saving first), and wait until its process is gone.
+ * - Returns false when it is busy and keeps running (HTTP 409; versions up to 1.0.4 stop anyway). Ask again later.
+ * - Throws when it keeps running after it agreed to stop: two servers must never share the sessions and settings.
  */
 async function stopRunningInstance(running) {
-  await fetch(`http://127.0.0.1:${running.port}/shutdown`, { method: 'POST', headers: { 'X-Caliope-Secret': running.secret, 'X-Caliope-Reason': 'update' }, signal: AbortSignal.timeout(5000) }).catch(() => {});
+  const response = await fetch(`http://127.0.0.1:${running.port}/shutdown`, { method: 'POST', headers: { 'X-Caliope-Secret': running.secret, 'X-Caliope-Reason': 'update' }, signal: AbortSignal.timeout(5000) }).catch(() => null);
+  if (response?.status === 409) return false;
   for (let waited = 0; isProcessAlive(running.pid) && waited < 15000; waited += 250) await sleep(250);
   if (isProcessAlive(running.pid)) {
     throw new Error(`${APP_NAME} ${running.version} is still running and did not stop for the new version. Close it from the Task Manager (node.exe, process ${running.pid}) and start ${APP_NAME} again.`);
   }
+  return true;
 }
 
 /** A one-time link token from the running server; its launch secret travels in a header, never in the link. */
@@ -262,12 +347,7 @@ async function showError(message) {
   try {
     process.stderr.write(`${message}\n`);
     if (process.platform !== 'win32') return;
-    const script = [
-      'Add-Type -AssemblyName PresentationFramework',
-      '$text = [Console]::In.ReadToEnd()',
-      "[void][System.Windows.MessageBox]::Show($text, 'Caliope', 'OK', 'Error')",
-    ].join('\n');
-    await runPowerShell(script, { input: message, timeoutMs: 10 * 60 * 1000 });
+    await showErrorBox(message);
   } catch {
     // Nothing else to try.
   }

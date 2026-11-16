@@ -7,7 +7,7 @@
 //   read by other programs, so the link never carries the launch secret. A second launcher asks the
 //   running server for a token with that secret (from server.json, new for every start) in a header
 //   (POST /launch). A newer version that starts after an update stops the old server the same way
-//   (POST /shutdown).
+//   (POST /shutdown), or waits while the old one is busy.
 //   The cookie is SameSite=Strict, so other websites cannot send it. Its value is new for every server
 //   start and never the launch secret.
 // - Browsers also send the cookie to every other server on 127.0.0.1 (cookies ignore the port), so a
@@ -56,7 +56,7 @@ export class HttpError extends Error {
   }
 }
 
-export function createAppServer({ config, secret, routes, hub, log, onShutdown }) {
+export function createAppServer({ config, secret, routes, hub, log, isBusy, onShutdown }) {
   let port = 0;
   // Launch token -> expiry time.
   const launchTokens = new Map();
@@ -115,9 +115,15 @@ export function createAppServer({ config, secret, routes, hub, log, onShutdown }
         sendJson(response, 403, { error: 'Not authorized.' });
         return;
       }
-      sendJson(response, 200, { ok: true });
       // "update" when a newer version stops this one. Otherwise the uninstall or another program asked.
-      onShutdown?.(request.headers['x-caliope-reason'] === 'update' ? 'update' : 'stopped');
+      const reason = request.headers['x-caliope-reason'] === 'update' ? 'update' : 'stopped';
+      // A turn, a question or a background command keeps this version running: the newer one asks again later.
+      if (reason === 'update' && isBusy()) {
+        sendJson(response, 409, { error: 'Caliope is busy.' });
+        return;
+      }
+      sendJson(response, 200, { ok: true });
+      onShutdown?.(reason);
       return;
     }
     if (url.pathname === '/auth') {

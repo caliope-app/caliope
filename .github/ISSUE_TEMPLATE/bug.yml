@@ -6,8 +6,8 @@ body:
     id: version
     attributes:
       label: Caliope version
-      description: Settings → Version.
-      placeholder: 1.0.0
+      description: Settings → App.
+      placeholder: 1.1.0
     validations:
       required: true
   - type: textarea

@@ -1,10 +1,15 @@
-// Checks the built release files as a user's PC would use them. The release workflow runs it before publishing.
+// Checks the built release files as a user's PC would use them. The release workflow runs it before publishing,
+// in a job of its own without write rights: it runs a package from npm.
 //   node tools/release-check.mjs dist/Caliope-windows-x64.zip [--install]
-// - Unpacks the zip, and starts Microsoft's Azure DevOps MCP server the way Settings > MCP servers >
-//   "Add Azure DevOps" does, with only the zip's own Node.js and npx on PATH.
+// - Serves dist\ as a local copy of the release, and installs the zip from there the way the in-app update does
+//   (server/updates.js): it checks manifest.json's signature and the zip's SHA-256, and unpacks with Windows' own
+//   tar.exe. The publish job makes the real manifest.json.sig only after this check, so a throwaway key signs here.
+// - Starts Microsoft's Azure DevOps MCP server the way Settings > MCP servers > "Add Azure DevOps" does, with
+//   only the zip's own Node.js and npx on PATH.
 // - With --install (only on the release workflow's disposable runner: it installs for the current user):
-//   serves dist\ as a local copy of the release, runs the install line against it, checks the installed
-//   files and the Settings > Apps entry, and uninstalls again.
+//   runs the install line against the local copy of the release, checks the installed files and the Settings > Apps
+//   entry, adds the Startup entry of "Keep running for scheduled tasks", and checks that the uninstall removes it all.
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
@@ -12,14 +17,46 @@ import path from 'node:path';
 import { execFileSync, execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { pathToFileURL } from 'node:url';
+import { UpdateChecker } from '../server/updates.js';
+import { POWERSHELL } from '../server/windows.js';
 
 const zip = path.resolve(process.argv[2] || 'dist/Caliope-windows-x64.zip');
-// The long form of the folder: a runner's TEMP can be a short 8.3 name such as RUNNER~1.
-const folder = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'caliope-release-')));
-execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', `Expand-Archive -LiteralPath '${zip.replace(/'/g, "''")}' -DestinationPath '${folder.replace(/'/g, "''")}'`], { stdio: 'inherit' });
+const dist = path.dirname(zip);
+const manifestBytes = fs.readFileSync(path.join(dist, 'manifest.json'));
+const { version } = JSON.parse(manifestBytes);
+const releaseKeys = crypto.generateKeyPairSync('ed25519');
+const signature = `${crypto.sign(null, manifestBytes, releaseKeys.privateKey).toString('base64')}\n`;
+// releases/latest/download/<file> and releases/download/v<version>/<file>, like GitHub serves them.
+const releases = http.createServer((request, response) => {
+  const name = path.basename(decodeURIComponent(new URL(request.url, 'http://x').pathname));
+  const file = path.join(dist, name);
+  const served = request.url.startsWith('/latest/download/') || request.url.startsWith(`/download/v${version}/`);
+  if (served && name === 'manifest.json.sig') {
+    response.end(signature);
+    return;
+  }
+  if (!served || !fs.existsSync(file)) {
+    response.writeHead(404);
+    response.end();
+    return;
+  }
+  response.writeHead(200, { 'Content-Length': fs.statSync(file).size });
+  fs.createReadStream(file).pipe(response);
+});
+await new Promise((resolve) => releases.listen(0, '127.0.0.1', resolve));
+const releasesUrl = `http://127.0.0.1:${releases.address().port}`;
+
+// The folder plays %LOCALAPPDATA%\Programs\Caliope, so the update leaves the Settings > Apps entry alone. The long
+// form of the folder: a runner's TEMP can be a short 8.3 name such as RUNNER~1.
+const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'caliope-release-')));
+const updates = new UpdateChecker({ releasesUrl, currentVersion: '0.0.0', installed: true, root, publicKey: releaseKeys.publicKey, isBusy: () => false, hub: { broadcast() {}, clientCount: 0 }, log: console });
+await updates.install({ start: false });
+if (fs.readFileSync(path.join(root, 'Caliope.cmd'), 'utf8') !== `@call "%~dp0${version}\\Caliope.cmd" %*\r\n`) throw new Error('The update did not point the launcher at the new version.');
+const folder = path.join(root, version);
 for (const file of ['Caliope.cmd', 'install.ps1', 'runtime/node.exe', 'runtime/npx.cmd', 'runtime/npm.cmd', 'runtime/node_modules/npm/bin/npx-cli.js']) {
   if (!fs.existsSync(path.join(folder, file))) throw new Error(`The zip has no ${file}.`);
 }
+console.log(`The in-app update installed ${version} from the zip with tar.exe.`);
 
 // No other Node.js may help: PATH keeps only Windows' own folders.
 const windows = process.env.SystemRoot || 'C:\\Windows';
@@ -46,43 +83,32 @@ if (tools.length === 0) {
 }
 console.log(`The Azure DevOps MCP server started with the zip's npx and listed ${tools.length} tools, for example ${tools.slice(0, 3).map((tool) => tool.tool).join(', ')}.`);
 
-if (process.argv.includes('--install')) await checkInstaller(path.dirname(zip));
+if (process.argv.includes('--install')) await checkInstaller();
+releases.close();
 process.exit(0);
 
-async function checkInstaller(dist) {
-  const { version } = JSON.parse(fs.readFileSync(path.join(dist, 'manifest.json'), 'utf8'));
-  // releases/latest/download/<file>, like GitHub serves them.
-  const releases = http.createServer((request, response) => {
-    const file = path.join(dist, path.basename(decodeURIComponent(new URL(request.url, 'http://x').pathname)));
-    if (!request.url.startsWith('/latest/download/') || !fs.existsSync(file)) {
-      response.writeHead(404);
-      response.end();
-      return;
-    }
-    response.writeHead(200, { 'Content-Length': fs.statSync(file).size });
-    fs.createReadStream(file).pipe(response);
-  });
-  await new Promise((resolve) => releases.listen(0, '127.0.0.1', resolve));
-  const releasesUrl = `http://127.0.0.1:${releases.address().port}`;
-  const powershell = (command) => promisify(execFile)('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', command], { env: { ...process.env, CALIOPE_RELEASES_URL: releasesUrl }, timeout: 300000 });
-  try {
-    // The install line, with -NoStart so the runner does not open Caliope.
-    const installed = await powershell(`& ([scriptblock]::Create((irm '${releasesUrl}/latest/download/install.ps1' -UseBasicParsing))) -NoStart`);
-    console.log(installed.stdout.trim());
-    const root = path.join(process.env.LOCALAPPDATA, 'Programs', 'Caliope');
-    for (const file of ['Caliope.cmd', 'Caliope.ico', `${version}/Caliope.cmd`, `${version}/runtime/npx.cmd`, `${version}/install.ps1`]) {
-      if (!fs.existsSync(path.join(root, file))) throw new Error(`The installer did not create ${file}.`);
-    }
-    const entry = await powershell("(Get-ItemProperty 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Caliope').DisplayVersion");
-    if (entry.stdout.trim() !== version) throw new Error(`The Settings > Apps entry shows version "${entry.stdout.trim()}" instead of ${version}.`);
-    const again = await powershell(`& ([scriptblock]::Create((irm '${releasesUrl}/latest/download/install.ps1' -UseBasicParsing))) -NoStart`);
-    if (!/already installed/.test(again.stdout)) throw new Error(`Installing the same version again did not say it is already installed: ${again.stdout}`);
-    // The uninstall command exactly as Settings > Apps runs it.
-    const uninstall = (await powershell("(Get-ItemProperty 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Caliope').UninstallString")).stdout.trim();
-    await promisify(execFile)(process.env.ComSpec || 'cmd.exe', ['/d', '/s', '/c', `"${uninstall}"`], { windowsVerbatimArguments: true, timeout: 300000 });
-    if (fs.existsSync(root)) throw new Error(`The uninstall left ${root} behind.`);
-    console.log(`The install line installed ${version}, recognized it on a second run, and the uninstall removed it.`);
-  } finally {
-    releases.close();
+async function checkInstaller() {
+  const powershell = (command) => promisify(execFile)(POWERSHELL, ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', command], { env: { ...process.env, CALIOPE_RELEASES_URL: releasesUrl }, timeout: 300000 });
+  // The install line, with -NoStart so the runner does not open Caliope.
+  const installed = await powershell(`& ([scriptblock]::Create((irm '${releasesUrl}/latest/download/install.ps1' -UseBasicParsing))) -NoStart`);
+  console.log(installed.stdout.trim());
+  const installRoot = path.join(process.env.LOCALAPPDATA, 'Programs', 'Caliope');
+  for (const file of ['Caliope.cmd', 'Caliope.ico', 'install.ps1', `${version}/Caliope.cmd`, `${version}/runtime/npx.cmd`, `${version}/install.ps1`]) {
+    if (!fs.existsSync(path.join(installRoot, file))) throw new Error(`The installer did not create ${file}.`);
   }
+  const entry = await powershell("(Get-ItemProperty 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Caliope').DisplayVersion");
+  if (entry.stdout.trim() !== version) throw new Error(`The Settings > Apps entry shows version "${entry.stdout.trim()}" instead of ${version}.`);
+  const again = await powershell(`& ([scriptblock]::Create((irm '${releasesUrl}/latest/download/install.ps1' -UseBasicParsing))) -NoStart`);
+  if (!/already installed/.test(again.stdout)) throw new Error(`Installing the same version again did not say it is already installed: ${again.stdout}`);
+  // The Startup entry the installed copy writes for "Keep running for scheduled tasks".
+  const { setStartAtSignIn } = await load('server/windows.js');
+  const startupEntry = path.join(process.env.APPDATA, 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup', 'Caliope.cmd');
+  fs.mkdirSync(path.dirname(startupEntry), { recursive: true });
+  setStartAtSignIn(true, path.join(installRoot, 'Caliope.cmd'));
+  // The uninstall command exactly as Settings > Apps runs it.
+  const uninstall = (await powershell("(Get-ItemProperty 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Caliope').UninstallString")).stdout.trim();
+  await promisify(execFile)(process.env.ComSpec || 'cmd.exe', ['/d', '/s', '/c', `"${uninstall}"`], { windowsVerbatimArguments: true, timeout: 300000 });
+  if (fs.existsSync(installRoot)) throw new Error(`The uninstall left ${installRoot} behind.`);
+  if (fs.existsSync(startupEntry)) throw new Error(`The uninstall left the Startup entry ${startupEntry} behind.`);
+  console.log(`The install line installed ${version}, recognized it on a second run, and the uninstall removed it and its Startup entry.`);
 }

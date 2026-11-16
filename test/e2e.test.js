@@ -187,11 +187,12 @@ test('an edit turn with approvals changes the file, records cost, and rewind res
   const done = await runTurn(id, 'Improve it [mock:edit notes.txt]', {
     respond: [
       { kind: 'permission', payload: { decision: 'allow' } },
-      { kind: 'permission', payload: { decision: 'allow_session', prefix: 'Get-Content' } },
+      // A rule for a program that prints files names the file (a bare "Get-Content" is refused).
+      { kind: 'permission', payload: { decision: 'allow_session', prefix: "Get-Content -LiteralPath 'notes.txt'" } },
     ],
   });
   assert.equal(fs.readFileSync(path.join(project, 'notes.txt'), 'utf8'), 'Hello world (edited by the agent)\r\nSecond line\r\n');
-  assert.deepEqual(done.allowRules, ['Get-Content']);
+  assert.deepEqual(done.allowRules, ["Get-Content -LiteralPath 'notes.txt'"]);
   assert.ok(done.meta.usage.nanoAiu > 0);
   assert.ok(done.meta.usage.requests >= 4);
   const commandResult = done.messages.flatMap((message) => message.content).find((block) => block.type === 'tool_result' && block.meta?.exitCode === 0);
@@ -226,6 +227,17 @@ test('plan mode uses the planning model, then building continues on the building
   assert.equal(last.body.model, 'claude-opus-5.5');
   assert.equal(last.body.output_config.effort, 'low');
   assert.ok(agentCalls.some((request) => request.body.model === 'claude-opus-5.5' && request.body.output_config.effort === 'high'), 'planning ran at the planning effort');
+});
+
+test('a model and effort picked before the session starts apply to its first message', async () => {
+  const session = await api('POST', '/api/sessions', { cwd: project, mode: 'full', model: 'claude-haiku-5.5', effort: 'low' });
+  assert.equal(session.meta.model, 'claude-haiku-5.5');
+  assert.equal(session.meta.effort, 'low');
+  await runTurn(session.meta.id, 'Look around [mock:multi]');
+  const requests = await (await fetch(`http://127.0.0.1:${MOCK_PORT}/__requests`)).json();
+  const last = requests.filter((request) => request.path === '/v1/messages' && Array.isArray(request.body.tools) && request.body.tools.length > 0).at(-1);
+  assert.equal(last.body.model, 'claude-haiku-5.5');
+  assert.equal(last.body.output_config.effort, 'low');
 });
 
 test('denying an action without feedback stops the turn and skips the remaining tool calls', async () => {
@@ -1350,7 +1362,12 @@ test('browser (headless): a page that moves to a site the user has not approved 
 test('two starts at once with the same data folder: one server, the other start uses it', async () => {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'caliope-double-'));
   const mock = `http://127.0.0.1:${MOCK_PORT}`;
-  const env = { ...process.env, CALIOPE_DATA_DIR: dataDir, CALIOPE_PLAIN_SECRETS: '1', CALIOPE_NO_BROWSER: '1', CALIOPE_API_BASE: mock, CALIOPE_GITHUB_WEB: mock, CALIOPE_GITHUB_API: mock, CALIOPE_RELEASES_URL: `${mock}/__releases` };
+  // A stand-in for %APPDATA%, with the Startup entry this copy writes when the user turned "Keep running" on.
+  const roaming = path.join(dataDir, 'roaming');
+  const startupEntry = path.join(roaming, 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup', 'Caliope.cmd');
+  fs.mkdirSync(path.dirname(startupEntry), { recursive: true });
+  fs.writeFileSync(startupEntry, `@chcp 65001>nul\r\n@call "${path.join(root, 'Caliope.cmd')}" --background\r\n`);
+  const env = { ...process.env, APPDATA: roaming, CALIOPE_DATA_DIR: dataDir, CALIOPE_PLAIN_SECRETS: '1', CALIOPE_NO_BROWSER: '1', CALIOPE_API_BASE: mock, CALIOPE_GITHUB_WEB: mock, CALIOPE_GITHUB_API: mock, CALIOPE_RELEASES_URL: `${mock}/__releases` };
   const launch = () => {
     const child = spawn(process.execPath, ['server/main.js', '--stay'], { cwd: root, env, stdio: 'ignore' });
     children.push(child);
@@ -1366,6 +1383,7 @@ test('two starts at once with the same data folder: one server, the other start 
   const server = JSON.parse(fs.readFileSync(path.join(dataDir, 'server.json'), 'utf8'));
   const survivor = [first, second].find(({ child }) => child.exitCode === null).child;
   assert.equal(server.pid, survivor.pid);
+  assert.ok(fs.existsSync(startupEntry), 'a start with another data folder, where the setting is off, leaves the user\'s Startup entry');
   survivor.kill();
 });
 
@@ -1438,6 +1456,13 @@ test("the agent opens and merges pull requests on GitHub and Azure DevOps with g
   await git('remote', 'set-url', 'origin', 'https://dev.azure.com/test/proj/_git/caliope-pr');
   const azure = lastToolResult(await runTurn(full.meta.id, `Open it [mock:tool create_pull_request ${JSON.stringify(input)}]`));
   assert.equal(azure.meta.url, 'https://dev.azure.com/test/proj/_git/caliope-pr/pullrequest/12');
+  // Branch policies: a reviewer by email and a linked work item go along, and read_pull_request shows the review state.
+  const withPolicies = lastToolResult(await runTurn(full.meta.id, `Open it [mock:tool create_pull_request ${JSON.stringify({ ...input, reviewers: ['ann@example.com'], work_items: [101] })}]`));
+  assert.equal(withPolicies.meta.number, 12);
+  const azureCreated = (await (await fetch(`http://127.0.0.1:${MOCK_PORT}/__requests`)).json()).filter((request) => request.method === 'POST' && request.path.endsWith('/pullrequests')).at(-1);
+  assert.deepEqual([azureCreated.body.reviewers, azureCreated.body.workItemRefs], [[{ id: 'a5b1c2d3-0000-4000-8000-000000000001' }], [{ id: '101' }]]);
+  const review = lastToolResult(await runTurn(full.meta.id, 'Read it [mock:tool read_pull_request {}]'));
+  assert.match(review.content, /Reviewers: Ann \(approved, required\), Bob \(waiting for author\)\.\nWork items: 101\./);
   // Azure DevOps: the pull request of the current branch. A non-blocking policy that still runs does not stop it.
   const completed = lastToolResult(await runTurn(full.meta.id, 'Merge it [mock:tool merge_pull_request {}]', { respond: [{ kind: 'permission', payload: { decision: 'allow' } }] }));
   assert.match(completed.content, /Merged pull request 12 \(feature\/export into main\) on Azure DevOps as c0ffee000000\./);

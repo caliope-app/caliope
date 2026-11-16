@@ -85,11 +85,13 @@ export async function pullRequestSource(cwd, extraPath) {
 
 /**
  * Push the current branch to origin and open a pull request into `target` (the default branch when empty).
+ * - `reviewers`: Azure DevOps email addresses or identity IDs, or GitHub user names. `workItems`: Azure DevOps
+ *   work item IDs to link.
  * - `endpoints`: { githubApi, azureDevOpsUrl } (the API addresses, which tests point at a mock).
- * - Returns { created, url, number, provider, existing?, reason? }. `created` is false when it only gives the
- *   "create pull request" page (no sign-in) or found an open pull request for the branch.
+ * - Returns { created, url, number, provider, existing?, reason?, descriptionCut?, warning? }. `created` is false
+ *   when it only gives the "create pull request" page (no sign-in) or found an open pull request for the branch.
  */
-export async function createPullRequest({ cwd, source, title, description = '', target = '', draft = false, endpoints, signal }) {
+export async function createPullRequest({ cwd, source, title, description = '', target = '', draft = false, reviewers = [], workItems = [], endpoints, signal }) {
   const { gitExe, remote, branch } = source;
   const credential = await gitCredential(gitExe, cwd, remote);
   const api = apiFor(remote, credential, endpoints);
@@ -100,8 +102,34 @@ export async function createPullRequest({ cwd, source, title, description = '', 
     const reason = credential ? `${providerName(remote)} did not accept git's sign-in for this repository.` : `git has no saved sign-in for ${providerName(remote)}.`;
     return { created: false, provider: remote.provider, url: api.createPageUrl(branch, base, title, description), reason };
   }
-  const result = await api.create({ branch, base, title, description, draft, signal });
+  const result = await api.create({ branch, base, title, description, draft, reviewers, workItems, signal });
   return { provider: remote.provider, ...result };
+}
+
+/**
+ * One pull request with its review state: `number`, or the open one for the current branch.
+ * - Returns the pull request: provider, repository, number, title, url, state, draft, author, source, target,
+ *   description and mergeCheck.
+ * - `reviewers`: [{ name, vote, required }].
+ * - `workItems`: [id] on Azure DevOps; null on GitHub or when unreadable.
+ * - `checks`: [{ name, status, required }], or null when unreadable.
+ * - `threads`: [{ status, path, line, comments: [{ author, date, text }] }].
+ * - `commentsCut`: true on GitHub when it returned only its first 100 reviews, comments or code comments.
+ * - Uses only a sign-in git already saved, like listPullRequests.
+ */
+export async function readPullRequest({ cwd, extraPath, number, endpoints, signal }) {
+  const gitExe = findGit(extraPath);
+  if (!gitExe) throw new Error('git was not found on this PC.');
+  const remoteUrl = (await runGit(gitExe, ['remote', 'get-url', 'origin'], cwd).catch(() => '')).trim();
+  const remote = parseRemote(remoteUrl);
+  if (!remote) throw new Error(remoteUrl ? `Caliope reads pull requests on GitHub and Azure DevOps; origin is ${shownRemote(remoteUrl)}.` : 'This repository has no remote named origin.');
+  const branch = number ? null : (await runGit(gitExe, ['rev-parse', '--abbrev-ref', 'HEAD'], cwd)).trim();
+  if (!number && (!branch || branch === 'HEAD')) throw new Error('HEAD is detached. Give the pull request number.');
+  const credential = await gitCredential(gitExe, cwd, remote, { interactive: false });
+  if (!credential) throw new Error(`git has no saved sign-in for ${providerName(remote)}. Push or pull once in this repository, then try again.`);
+  const pullRequest = await apiFor(remote, credential, endpoints).read({ number, branch, signal });
+  const read = { provider: remote.provider, repository: repositoryName(remote), ...pullRequest };
+  return read;
 }
 
 /**
@@ -180,6 +208,13 @@ async function gitCredential(gitExe, cwd, remote, { interactive = true } = {}) {
 function githubApi(remote, credential, endpoints) {
   const repoUrl = `${endpoints.githubApi}/repos/${remote.owner}/${remote.repo}`;
   const headers = { Authorization: `Bearer ${credential?.password}`, Accept: 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28', 'User-Agent': 'Caliope' };
+  /** The number of the open pull request of `branch`. */
+  async function openNumber(branch, signal) {
+    const open = await request(`${repoUrl}/pulls?state=open&head=${encodeURIComponent(`${remote.owner}:${branch}`)}`, { headers, signal });
+    const found = open.data?.[0]?.number;
+    if (!found) throw new Error(`The branch ${branch} has no open pull request on GitHub.`);
+    return found;
+  }
   return {
     async defaultBranch(signal) {
       const repository = await request(repoUrl, { headers, signal });
@@ -191,9 +226,17 @@ function githubApi(remote, credential, endpoints) {
       const pullRequests = open.data.map((pull) => ({ number: pull.number, title: pull.title, url: pull.html_url, author: pull.user?.login || '', source: pull.head?.ref || '', target: pull.base?.ref || '', draft: Boolean(pull.draft), updatedAt: pull.updated_at || null }));
       return pullRequests;
     },
-    async create({ branch, base, title, description, draft, signal }) {
+    async create({ branch, base, title, description, draft, reviewers, signal }) {
       const created = await request(`${repoUrl}/pulls`, { method: 'POST', headers, body: { title, head: branch, base, body: description, draft }, signal });
-      if (created.status === 201) return { created: true, url: created.data.html_url, number: created.data.number };
+      if (created.status === 201) {
+        const opened = { created: true, url: created.data.html_url, number: created.data.number };
+        // GitHub adds reviewers after the pull request exists. A refusal leaves the pull request open without them.
+        if (reviewers.length > 0) {
+          const asked = await request(`${repoUrl}/pulls/${created.data.number}/requested_reviewers`, { method: 'POST', headers, body: { reviewers }, signal });
+          if (!asked.ok) opened.warning = `GitHub did not add the reviewers (HTTP ${asked.status}): ${asked.data?.message || asked.text.slice(0, 300)}`;
+        }
+        return opened;
+      }
       if (created.status === 422 && /already exists/i.test(created.text)) {
         const open = await request(`${repoUrl}/pulls?state=open&head=${encodeURIComponent(`${remote.owner}:${branch}`)}`, { headers, signal });
         if (open.data?.[0]) return { created: false, existing: true, url: open.data[0].html_url, number: open.data[0].number };
@@ -201,12 +244,7 @@ function githubApi(remote, credential, endpoints) {
       throw new Error(`GitHub refused the pull request (HTTP ${created.status}): ${created.data?.message || created.text.slice(0, 300)}`);
     },
     async pullRequest({ number, branch, signal }) {
-      let found = number;
-      if (!found) {
-        const open = await request(`${repoUrl}/pulls?state=open&head=${encodeURIComponent(`${remote.owner}:${branch}`)}`, { headers, signal });
-        found = open.data?.[0]?.number;
-        if (!found) throw new Error(`The branch ${branch} has no open pull request on GitHub.`);
-      }
+      const found = number || (await openNumber(branch, signal));
       // GitHub works out whether it can be merged in the background. `mergeable` is null until then.
       let details;
       for (let attempt = 0; attempt < 4; attempt++) {
@@ -246,6 +284,59 @@ function githubApi(remote, credential, endpoints) {
       }
       return { completed: true, commit: merged.data.sha, branchDeleted };
     },
+    async read({ number, branch, signal }) {
+      const found = number || (await openNumber(branch, signal));
+      const details = await request(`${repoUrl}/pulls/${found}`, { headers, signal });
+      if (!details.ok) throw new Error(`GitHub did not return pull request ${found} (HTTP ${details.status}): ${details.data?.message || details.text.slice(0, 300)}`);
+      const pull = details.data;
+      const [reviews, comments, codeComments, checkRuns] = await Promise.all([
+        request(`${repoUrl}/pulls/${found}/reviews?per_page=100`, { headers, signal }),
+        request(`${repoUrl}/issues/${found}/comments?per_page=100`, { headers, signal }),
+        request(`${repoUrl}/pulls/${found}/comments?per_page=100`, { headers, signal }),
+        request(`${repoUrl}/commits/${pull.head.sha}/check-runs?per_page=100`, { headers, signal }),
+      ]);
+      const list = (answer) => (answer.ok && Array.isArray(answer.data) ? answer.data : []);
+      const comment = (item, date) => ({ author: item.user?.login || '', date: date || null, text: item.body || '' });
+      // Each reviewer's last verdict, as on GitHub's page. A reviewer asked again is waiting for a new review.
+      const votes = new Map();
+      for (const review of list(reviews)) if (['APPROVED', 'CHANGES_REQUESTED', 'DISMISSED'].includes(review.state)) votes.set(review.user?.login || '', review.state.toLowerCase().replace('_', ' '));
+      for (const user of pull.requested_reviewers || []) votes.set(user.login, 'review requested');
+      // Review summaries and comments on the conversation are threads of their own. Code comments are grouped by
+      // the comment they answer.
+      const threads = [
+        ...list(reviews).filter((review) => review.body?.trim()).map((review) => ({ status: review.state.toLowerCase().replace('_', ' '), path: null, line: null, comments: [comment(review, review.submitted_at)] })),
+        ...list(comments).map((item) => ({ status: null, path: null, line: null, comments: [comment(item, item.created_at)] })),
+      ];
+      const codeThreads = new Map();
+      for (const item of list(codeComments)) {
+        const root = item.in_reply_to_id || item.id;
+        if (!codeThreads.has(root)) codeThreads.set(root, { status: null, path: item.path || null, line: item.line ?? item.original_line ?? null, comments: [] });
+        codeThreads.get(root).comments.push(comment(item, item.created_at));
+      }
+      threads.push(...codeThreads.values());
+      threads.sort((a, b) => String(a.comments[0].date).localeCompare(String(b.comments[0].date)));
+      const checks = checkRuns.ok ? (checkRuns.data?.check_runs || []).map((run) => ({ name: run.name, status: run.conclusion || run.status, required: false })) : null;
+      // GitHub sends at most 100 items per page, and only the first page is read.
+      const commentsCut = [reviews, comments, codeComments].some((answer) => list(answer).length === 100);
+      const read = {
+        number: pull.number,
+        title: pull.title,
+        url: pull.html_url,
+        state: pull.merged ? 'merged' : pull.state,
+        draft: Boolean(pull.draft),
+        author: pull.user?.login || '',
+        source: pull.head.ref,
+        target: pull.base.ref,
+        description: pull.body || '',
+        mergeCheck: pull.mergeable_state || null,
+        reviewers: [...votes].map(([name, vote]) => ({ name, vote, required: false })),
+        workItems: null,
+        checks,
+        threads,
+        commentsCut,
+      };
+      return read;
+    },
     createPageUrl(branch, base, title, description) {
       const query = new URLSearchParams({ quick_pull: '1', title: title || '', body: description || '' });
       // Branch names keep their slashes in GitHub's compare address.
@@ -262,6 +353,41 @@ function azureApi(remote, credential, endpoints) {
   const token = credential?.password || '';
   const authorization = /^eyJ[\w-]*\.[\w-]+\.[\w-]+$/.test(token) ? `Bearer ${token}` : `Basic ${Buffer.from(`:${token}`).toString('base64')}`;
   const headers = { Authorization: authorization, Accept: 'application/json' };
+  // People are looked up on the organization's identity host (vssps).
+  const identityUrl = endpoints.azureDevOpsUrl ? base : remote.baseUrl.startsWith('https://dev.azure.com/') ? `https://vssps.dev.azure.com/${encodeURIComponent(remote.organization)}` : `https://${remote.organization}.vssps.visualstudio.com`;
+
+  /** The pull request `number`, or the active one of `branch`. */
+  async function findPull({ number, branch, signal }) {
+    if (number) {
+      const found = await request(`${repoUrl}/pullrequests/${number}?api-version=7.1`, { headers, signal });
+      if (!found.ok) throw new Error(`Azure DevOps did not return pull request ${number} (HTTP ${found.status}): ${found.data?.message || 'not signed in'}`);
+      return found.data;
+    }
+    const query = new URLSearchParams({ 'searchCriteria.sourceRefName': `refs/heads/${branch}`, 'searchCriteria.status': 'active', 'api-version': '7.1' });
+    const search = await request(`${repoUrl}/pullrequests?${query}`, { headers, signal });
+    if (!search.ok) throw new Error(`Azure DevOps did not search the pull requests of ${branch} (HTTP ${search.status}): ${search.data?.message || 'not signed in'}`);
+    const pull = search.data.value?.[0];
+    if (!pull) throw new Error(`The branch ${branch} has no active pull request on Azure DevOps.`);
+    return pull;
+  }
+
+  /** The branch policies of a pull request (reviewers, builds, linked work items) with the state of each. */
+  async function policyEvaluations(pull, signal) {
+    const artifactId = `vstfs:///CodeReview/CodeReviewId/${pull.repository.project.id}/${pull.pullRequestId}`;
+    const evaluations = await request(`${base}/${encodeURIComponent(remote.project)}/_apis/policy/evaluations?artifactId=${encodeURIComponent(artifactId)}&api-version=7.1-preview.1`, { headers, signal });
+    return evaluations;
+  }
+
+  /** The identity ID of a reviewer given as an ID, or as an email address or name that matches one user or group. */
+  async function reviewerId(reviewer, signal) {
+    if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(reviewer)) return reviewer;
+    const query = new URLSearchParams({ searchFilter: 'General', filterValue: reviewer, queryMembership: 'None', 'api-version': '7.1' });
+    const found = await request(`${identityUrl}/_apis/identities?${query}`, { headers, signal });
+    const matches = found.ok && Array.isArray(found.data?.value) ? found.data.value : [];
+    if (matches.length !== 1) throw new Error(`Azure DevOps found ${matches.length === 0 ? 'no' : 'more than one'} user or group for the reviewer "${reviewer}"${found.ok ? '' : ` (HTTP ${found.status})`}, so no pull request was opened. Give the email address or the identity ID.`);
+    return matches[0].id;
+  }
+
   return {
     async defaultBranch(signal) {
       const repository = await request(`${repoUrl}?api-version=7.1`, { headers, signal });
@@ -275,10 +401,14 @@ function azureApi(remote, credential, endpoints) {
       const pullRequests = active.data.value.map((pull) => ({ number: pull.pullRequestId, title: pull.title, url: `${remote.webUrl}/pullrequest/${pull.pullRequestId}`, author: pull.createdBy?.displayName || '', source: branch(pull.sourceRefName), target: branch(pull.targetRefName), draft: Boolean(pull.isDraft), updatedAt: pull.creationDate || null }));
       return pullRequests;
     },
-    async create({ branch, base: target, title, description, draft, signal }) {
-      const body = { sourceRefName: `refs/heads/${branch}`, targetRefName: `refs/heads/${target}`, title, description: description.slice(0, MAX_AZURE_DESCRIPTION), isDraft: draft };
+    async create({ branch, base: target, title, description, draft, reviewers, workItems, signal }) {
+      const reviewerRefs = [];
+      for (const reviewer of reviewers) reviewerRefs.push({ id: await reviewerId(reviewer, signal) });
+      // Linked work items satisfy a "linked work item" branch policy.
+      const workItemRefs = workItems.map((id) => ({ id: String(id) }));
+      const body = { sourceRefName: `refs/heads/${branch}`, targetRefName: `refs/heads/${target}`, title, description: description.slice(0, MAX_AZURE_DESCRIPTION), isDraft: draft, reviewers: reviewerRefs, workItemRefs };
       const created = await request(`${repoUrl}/pullrequests?api-version=7.1`, { method: 'POST', headers, body, signal });
-      if (created.status === 201 && created.data) return { created: true, url: `${remote.webUrl}/pullrequest/${created.data.pullRequestId}`, number: created.data.pullRequestId };
+      if (created.status === 201 && created.data) return { created: true, url: `${remote.webUrl}/pullrequest/${created.data.pullRequestId}`, number: created.data.pullRequestId, descriptionCut: description.length > MAX_AZURE_DESCRIPTION };
       if (created.status === 409) {
         const query = new URLSearchParams({ 'searchCriteria.sourceRefName': `refs/heads/${branch}`, 'searchCriteria.status': 'active', 'api-version': '7.1' });
         const open = await request(`${repoUrl}/pullrequests?${query}`, { headers, signal });
@@ -288,16 +418,7 @@ function azureApi(remote, credential, endpoints) {
       throw new Error(`Azure DevOps refused the pull request (HTTP ${created.status}): ${created.data?.message || created.text.slice(0, 300)}`);
     },
     async pullRequest({ number, branch, signal }) {
-      let pull;
-      if (number) {
-        const found = await request(`${repoUrl}/pullrequests/${number}?api-version=7.1`, { headers, signal });
-        if (!found.ok) throw new Error(`Azure DevOps did not return pull request ${number} (HTTP ${found.status}): ${found.data?.message || 'not signed in'}`);
-        pull = found.data;
-      } else {
-        const query = new URLSearchParams({ 'searchCriteria.sourceRefName': `refs/heads/${branch}`, 'searchCriteria.status': 'active', 'api-version': '7.1' });
-        pull = (await request(`${repoUrl}/pullrequests?${query}`, { headers, signal })).data?.value?.[0];
-        if (!pull) throw new Error(`The branch ${branch} has no active pull request on Azure DevOps.`);
-      }
+      const pull = await findPull({ number, branch, signal });
       const url = `${remote.webUrl}/pullrequest/${pull.pullRequestId}`;
       const blockers = [];
       if (pull.status !== 'active') blockers.push(`It is ${pull.status}.`);
@@ -305,8 +426,7 @@ function azureApi(remote, credential, endpoints) {
       else if (pull.mergeStatus === 'conflicts') blockers.push('It has merge conflicts.');
       else if (pull.mergeStatus !== 'succeeded') blockers.push(`Azure DevOps reports the merge as "${pull.mergeStatus || 'not checked yet'}".`);
       // Required branch policies (reviewers, builds, linked work items) must have passed.
-      const artifactId = `vstfs:///CodeReview/CodeReviewId/${pull.repository.project.id}/${pull.pullRequestId}`;
-      const evaluations = await request(`${base}/${encodeURIComponent(remote.project)}/_apis/policy/evaluations?artifactId=${encodeURIComponent(artifactId)}&api-version=7.1-preview.1`, { headers, signal });
+      const evaluations = await policyEvaluations(pull, signal);
       if (!evaluations.ok) blockers.push('Caliope could not read the branch policies.');
       const unmet = (evaluations.data?.value || []).filter((evaluation) => evaluation.configuration?.isBlocking && evaluation.configuration?.isEnabled !== false && !['approved', 'notApplicable'].includes(evaluation.status));
       if (unmet.length > 0) blockers.push(`Required policies have not passed: ${unmet.map((evaluation) => `${evaluation.configuration.type?.displayName || 'policy'} (${evaluation.status})`).join(', ')}.`);
@@ -332,6 +452,49 @@ function azureApi(remote, credential, endpoints) {
         pull = (await request(pullRequestUrl, { headers, signal })).data || pull;
       }
       return { completed: pull.status === 'completed', commit: pull.lastMergeCommit?.commitId || null, branchDeleted: pull.status === 'completed' && Boolean(deleteBranch) };
+    },
+    async read({ number, branch, signal }) {
+      // A search by branch shortens the description to 400 characters, so the pull request is read by its number.
+      const id = number || (await findPull({ branch, signal })).pullRequestId;
+      const pull = await findPull({ number: id, signal });
+      const pullRequestUrl = `${repoUrl}/pullrequests/${id}`;
+      const [threads, workItems, evaluations] = await Promise.all([
+        request(`${pullRequestUrl}/threads?api-version=7.1`, { headers, signal }),
+        request(`${pullRequestUrl}/workitems?api-version=7.1`, { headers, signal }),
+        policyEvaluations(pull, signal),
+      ]);
+      if (!threads.ok) throw new Error(`Azure DevOps did not return the comments of pull request ${id} (HTTP ${threads.status}): ${threads.data?.message || 'not signed in'}`);
+      const votes = { 10: 'approved', 5: 'approved with suggestions', 0: 'no vote', '-5': 'waiting for author', '-10': 'rejected' };
+      const reviewers = (pull.reviewers || []).map((reviewer) => ({ name: reviewer.displayName || reviewer.uniqueName || '', vote: votes[reviewer.vote] || String(reviewer.vote), required: Boolean(reviewer.isRequired) }));
+      const checks = evaluations.ok ? (evaluations.data?.value || []).filter((evaluation) => evaluation.configuration?.isEnabled !== false).map((evaluation) => ({ name: evaluation.configuration?.settings?.displayName || evaluation.configuration?.type?.displayName || 'policy', status: evaluation.status, required: Boolean(evaluation.configuration?.isBlocking) })) : null;
+      // System comments are Azure DevOps' own notes (votes, pushes, policy changes), not review feedback.
+      const shownThreads = (threads.data.value || [])
+        .filter((thread) => !thread.isDeleted)
+        .map((thread) => ({
+          status: thread.status || null,
+          path: thread.threadContext?.filePath || null,
+          line: thread.threadContext?.rightFileStart?.line ?? thread.threadContext?.leftFileStart?.line ?? null,
+          comments: (thread.comments || []).filter((comment) => comment.commentType !== 'system' && !comment.isDeleted).map((comment) => ({ author: comment.author?.displayName || '', date: comment.publishedDate || null, text: comment.content || '' })),
+        }))
+        .filter((thread) => thread.comments.length > 0);
+      const branchName = (ref) => String(ref || '').replace(/^refs\/heads\//, '');
+      const read = {
+        number: pull.pullRequestId,
+        title: pull.title,
+        url: `${remote.webUrl}/pullrequest/${pull.pullRequestId}`,
+        state: pull.status,
+        draft: Boolean(pull.isDraft),
+        author: pull.createdBy?.displayName || '',
+        source: branchName(pull.sourceRefName),
+        target: branchName(pull.targetRefName),
+        description: pull.description || '',
+        mergeCheck: pull.mergeStatus || null,
+        reviewers,
+        workItems: workItems.ok ? (workItems.data?.value || []).map((item) => item.id) : null,
+        checks,
+        threads: shownThreads,
+      };
+      return read;
     },
     createPageUrl(branch, targetBranch) {
       const query = new URLSearchParams({ sourceRef: branch, ...(targetBranch ? { targetRef: targetBranch } : {}) });

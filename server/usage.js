@@ -2,8 +2,9 @@
 //
 // Cost comes from Copilot itself: each response carries `copilot_usage.total_nano_aiu`.
 // 1,000,000,000 nano-AIU = 1 AI credit = US$0.01 (GitHub Copilot usage-based billing).
-// When a response carries no cost, the request is counted as "unpriced" instead of free.
-import fs from 'node:fs';
+// When a response carries no cost, the request is counted as "unpriced" instead of free. A stream cut before
+// its usage came (`cut`, such as a stop by the user) counts as a request but not as unpriced: Copilot sends
+// no cost for it at all.
 import fsp from 'node:fs/promises';
 import { writeFileAtomic } from './util.js';
 import { userAgent } from './auth.js';
@@ -16,6 +17,7 @@ export class UsageLedger {
     this.file = file;
     this.log = log;
     this.entries = [];
+    this.writing = Promise.resolve();
   }
 
   async init() {
@@ -42,7 +44,11 @@ export class UsageLedger {
     }
   }
 
-  /** Append one request. `nanoAiu` is null when Copilot reported no cost. */
+  /**
+   * Append one request.
+   * - `nanoAiu` is null when Copilot reported no cost.
+   * - `cut`: the stream ended before it finished (see streamModelRequest). Only such lines have it.
+   */
   record(entry) {
     const line = {
       ts: new Date().toISOString(),
@@ -56,22 +62,34 @@ export class UsageLedger {
       cacheWrite: entry.usage.cacheWrite || 0,
       nanoAiu: typeof entry.usage.nanoAiu === 'number' ? entry.usage.nanoAiu : null,
     };
+    if (entry.usage.cut) line.cut = true;
     this.entries.push(line);
-    fs.appendFile(this.file, `${JSON.stringify(line)}\n`, (error) => {
-      if (error) this.log.warn('Could not append to the usage ledger.', error);
-    });
+    // One write after the other, so flush() can wait for the last one.
+    this.writing = this.writing.then(() => fsp.appendFile(this.file, `${JSON.stringify(line)}\n`)).catch((error) => this.log.warn('Could not append to the usage ledger.', error));
     return line;
   }
 
-  /** Nano-AIU spent in one project (its pathKey) this calendar month, in the PC's time zone. */
-  projectSpendThisMonth(project) {
+  /** Wait until the lines record() appends are written, before the app exits. */
+  flush() {
+    return this.writing;
+  }
+
+  /**
+   * Spending this calendar month, in the PC's time zone: { nanoAiu, unpricedRequests }.
+   * - For one project (its pathKey), or for all of Caliope without one.
+   * - `unpricedRequests`: requests Copilot reported no cost for, apart from cut streams. A spending limit
+   *   cannot count them.
+   */
+  spendThisMonth(project = null) {
     const now = new Date();
     const since = new Date(now.getFullYear(), now.getMonth(), 1).toISOString();
-    let nanoAiu = 0;
+    const spend = { nanoAiu: 0, unpricedRequests: 0 };
     for (const entry of this.entries) {
-      if (entry.project === project && entry.ts >= since && entry.nanoAiu !== null) nanoAiu += entry.nanoAiu;
+      if (entry.ts < since || (project && entry.project !== project)) continue;
+      if (entry.nanoAiu !== null) spend.nanoAiu += entry.nanoAiu;
+      else if (!entry.cut) spend.unpricedRequests++;
     }
-    return nanoAiu;
+    return spend;
   }
 
   /**
@@ -93,7 +111,7 @@ export class UsageLedger {
   }
 
   /**
-   * Totals for a period, split by day, model, kind and session.
+   * Totals for a period, split by day, model, kind, session and project (its pathKey).
    * - `since` / `until` are ISO timestamps. Omit them for everything kept.
    */
   summary({ since = null, until = null } = {}) {
@@ -102,6 +120,7 @@ export class UsageLedger {
     const byModel = new Map();
     const byKind = new Map();
     const bySession = new Map();
+    const byProject = new Map();
     for (const entry of this.entries) {
       if (since && entry.ts < since) continue;
       if (until && entry.ts >= until) continue;
@@ -110,6 +129,7 @@ export class UsageLedger {
       addEntry(getOrCreate(byModel, entry.model), entry);
       addEntry(getOrCreate(byKind, entry.kind), entry);
       if (entry.sessionId) addEntry(getOrCreate(bySession, entry.sessionId), entry);
+      if (entry.project) addEntry(getOrCreate(byProject, entry.project), entry);
     }
     const toList = (map, keyName) => [...map.entries()].map(([key, totals]) => ({ [keyName]: key, ...totals }));
     const summary = {
@@ -118,6 +138,7 @@ export class UsageLedger {
       byModel: toList(byModel, 'model').sort((a, b) => b.nanoAiu - a.nanoAiu),
       byKind: toList(byKind, 'kind').sort((a, b) => b.nanoAiu - a.nanoAiu),
       bySession: toList(bySession, 'sessionId').sort((a, b) => b.nanoAiu - a.nanoAiu),
+      byProject: toList(byProject, 'project').sort((a, b) => b.nanoAiu - a.nanoAiu),
     };
     return summary;
   }
@@ -145,15 +166,15 @@ function getOrCreate(map, key) {
 
 function addEntry(totals, entry) {
   totals.requests++;
-  if (entry.nanoAiu === null) totals.unpricedRequests++;
-  else totals.nanoAiu += entry.nanoAiu;
+  if (entry.nanoAiu !== null) totals.nanoAiu += entry.nanoAiu;
+  else if (!entry.cut) totals.unpricedRequests++;
   totals.input += entry.input;
   totals.output += entry.output;
   totals.cacheRead += entry.cacheRead;
   totals.cacheWrite += entry.cacheWrite;
 }
 
-/** Add one request to a session's running totals (kept in the session's meta). */
+/** Add one request to a session's running totals (kept in the session's meta). A cut stream is not unpriced (see record). */
 export function addToSessionUsage(sessionUsage, model, usage) {
   sessionUsage.requests++;
   sessionUsage.input += usage.input || 0;
@@ -161,7 +182,7 @@ export function addToSessionUsage(sessionUsage, model, usage) {
   sessionUsage.cacheRead += usage.cacheRead || 0;
   sessionUsage.cacheWrite += usage.cacheWrite || 0;
   if (typeof usage.nanoAiu === 'number') sessionUsage.nanoAiu += usage.nanoAiu;
-  else sessionUsage.unpricedRequests = (sessionUsage.unpricedRequests || 0) + 1;
+  else if (!usage.cut) sessionUsage.unpricedRequests = (sessionUsage.unpricedRequests || 0) + 1;
   sessionUsage.byModel = sessionUsage.byModel || {};
   const perModel = sessionUsage.byModel[model] || { requests: 0, nanoAiu: 0, input: 0, output: 0 };
   perModel.requests++;

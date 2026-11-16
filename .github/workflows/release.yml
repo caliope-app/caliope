@@ -1,0 +1,162 @@
+# Publishes a release when a tag such as v1.0.0 is pushed: runs the tests, builds the zip with the official
+# Node.js (which has npm and npx), checks that the zip starts the Azure DevOps MCP server with its own npx,
+# and only then signs manifest.json and publishes Caliope-windows-x64.zip, manifest.json, manifest.json.sig
+# and install.ps1.
+# - Three jobs. The check runs a package from npm, so it has no write rights and cannot change what is published:
+#   build (tests and dist\, with their SHA-256 hashes as an output), check (tools/release-check.mjs), and publish
+#   (compares dist\ with those hashes, signs, attests the zip's build provenance and publishes).
+# - manifest.json.sig is the Ed25519 signature of manifest.json in base64, made with the CALIOPE_SIGNING_KEY secret
+#   (a PKCS#8 PEM key). The in-app update installs only a manifest that matches RELEASE_PUBLIC_KEY in server/config.js.
+# node-security.yml calls this with a Node.js version. It then also raises the patch version, and commits and
+# tags that only after the checks passed. With dry_run it goes through the same steps, but pushes and publishes
+# nothing.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_call:
+    inputs:
+      node:
+        description: The exact Node.js version to build with
+        type: string
+        required: true
+      dry_run:
+        description: Go through every step, but push and publish nothing
+        type: boolean
+        default: false
+    secrets:
+      CALIOPE_SIGNING_KEY:
+        required: true
+
+permissions:
+  contents: read
+
+# One release at a time: a second one waits instead of stopping the first halfway.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  # "hashes=<file>:<sha256>,..." for the files in dist\, the same in the build and the publish job.
+  HASH_RELEASE_FILES: >-
+    const fs = require('fs'); const crypto = require('crypto');
+    console.log('hashes=' + fs.readdirSync('dist').sort().map((file) => file + ':' + crypto.createHash('sha256').update(fs.readFileSync('dist/' + file)).digest('hex')).join(','));
+
+jobs:
+  build:
+    runs-on: windows-latest
+    outputs:
+      hashes: ${{ steps.hashes.outputs.hashes }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          # Without check-latest the runner's cached Node.js is used, which can be behind.
+          node-version: ${{ inputs.node || '26' }}
+          check-latest: true
+      - name: Raise the patch version
+        if: inputs.node
+        run: npm version patch --no-git-tag-version
+      - name: Tests
+        run: node --test --test-concurrency=1 "test/*.test.js"
+      - name: Build the release files
+        run: node tools/package.mjs
+      - name: Hash the release files
+        id: hashes
+        run: node -e $env:HASH_RELEASE_FILES >> $env:GITHUB_OUTPUT
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-files
+          path: dist/
+          if-no-files-found: error
+
+  check:
+    needs: build
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ inputs.node || '26' }}
+          check-latest: true
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-files
+          path: dist
+      - name: Check the zip and the install line on a PC without Node.js
+        run: node tools/release-check.mjs dist/Caliope-windows-x64.zip --install
+
+  publish:
+    needs: [build, check]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # Only a run from node-security.yml pushes: the version commit and its tag.
+          persist-credentials: ${{ inputs.node && 'true' || 'false' }}
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ inputs.node || '26' }}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-files
+          path: dist
+      - name: Check that the release files are the ones the build job made
+        env:
+          EXPECTED: ${{ needs.build.outputs.hashes }}
+        run: |
+          actual=$(node -e "$HASH_RELEASE_FILES")
+          if [ "$actual" != "hashes=$EXPECTED" ]; then echo "The release files changed after the build job: $actual"; exit 1; fi
+      - name: Raise the patch version
+        if: inputs.node
+        run: npm version patch --no-git-tag-version
+      - name: Sign manifest.json
+        env:
+          CALIOPE_SIGNING_KEY: ${{ secrets.CALIOPE_SIGNING_KEY }}
+        run: |
+          node --input-type=module <<'EOF'
+          import crypto from 'node:crypto';
+          import fs from 'node:fs';
+          import { RELEASE_PUBLIC_KEY } from './server/config.js';
+          const manifest = fs.readFileSync('dist/manifest.json');
+          // The build job raised the version on its own: the commit below must name the version that was built.
+          const { version } = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+          if (JSON.parse(manifest).version !== version) throw new Error(`manifest.json is for ${JSON.parse(manifest).version}, package.json for ${version}.`);
+          const signature = crypto.sign(null, manifest, process.env.CALIOPE_SIGNING_KEY);
+          // A key that does not belong to the app's public key would make every update fail: stop here instead.
+          if (!crypto.verify(null, manifest, RELEASE_PUBLIC_KEY, signature)) throw new Error('CALIOPE_SIGNING_KEY does not belong to RELEASE_PUBLIC_KEY in server/config.js.');
+          fs.writeFileSync('dist/manifest.json.sig', `${signature.toString('base64')}\n`);
+          EOF
+      - name: Attest the zip's build provenance
+        if: ${{ !inputs.dry_run }}
+        uses: actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f # v3.2.0
+        with:
+          subject-path: dist/Caliope-windows-x64.zip
+      - name: Commit and tag the new version
+        if: inputs.node
+        env:
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          version=$(node -p "require('./package.json').version")
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -am "Caliope $version"
+          git tag "v$version"
+          # Atomic: when main moved meanwhile, neither main nor the tag is pushed, and the next run starts over.
+          if [ "$DRY_RUN" = 'true' ]; then git push --atomic --dry-run origin HEAD:main "v$version"; else git push --atomic origin HEAD:main "v$version"; fi
+      - name: Publish
+        if: ${{ !inputs.dry_run }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=$(node -p "require('./package.json').version")
+          gh release create "v$version" dist/Caliope-windows-x64.zip dist/manifest.json dist/manifest.json.sig dist/install.ps1 --title "Caliope v$version" --generate-notes

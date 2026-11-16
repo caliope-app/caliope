@@ -1,0 +1,15 @@
+name: Feature request
+description: Something Caliope should do.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: task
+    attributes:
+      label: What do you want to do?
+      description: The task or the problem, not only the solution.
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: How could Caliope help?

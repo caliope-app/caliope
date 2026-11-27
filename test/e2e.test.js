@@ -667,11 +667,13 @@ test('git: uncommitted changes, a worktree session with its own branch, and remo
   assert.ok(fs.existsSync(path.join(dirty.meta.worktree.folder, 'unsaved.txt')));
 });
 
-test('new project: creates a missing folder, lists it without sessions, and refuses bad paths', async () => {
+test('new project: creates a missing folder, lists it without sessions, tops the recent folders, and refuses bad paths', async () => {
   const folder = path.join(path.dirname(project), 'brand-new-project');
   const created = await api('POST', '/api/projects', { folder, name: 'Brand new', create: true });
   assert.equal(created.project.name, 'Brand new');
   assert.ok(fs.statSync(folder).isDirectory());
+  // The open app gets the new folder for its folder menus.
+  await waitFor((event) => event.type === 'settings' && event.settings.recentFolders[0] === folder);
   const listed = await api('GET', '/api/projects');
   assert.ok(listed.projects.some((item) => item.folder === folder && item.name === 'Brand new'));
   const existing = await api('POST', '/api/projects', { folder: project, name: 'Existing' });

@@ -1,7 +1,8 @@
-// Modals, confirmations, menus, toasts, and the folder browser.
-import { h, clear } from '../lib/dom.js';
+// Modals, confirmations, menus, toasts, the folder browser, and the New project dialog.
+import { h, clear, basename } from '../lib/dom.js';
 import { icon } from '../lib/icons.js';
 import { api } from '../lib/api.js';
+import { state, emit } from '../lib/store.js';
 
 const overlays = () => document.getElementById('overlays');
 const FOCUSABLE = 'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
@@ -148,6 +149,64 @@ export function openFolderBrowser({ title = 'Choose a project folder', initial =
     load(initial);
   });
   return answer;
+}
+
+/**
+ * New project: a name and a folder (an existing one, or a new path that gets created).
+ * - `onCreated(project)` runs with the saved project once the dialog has closed.
+ */
+export function openNewProjectDialog({ onCreated }) {
+  const nameInput = h('input', { class: 'input', placeholder: 'For example: Billing service', autofocus: true });
+  const folderInput = h('input', { class: 'input mono', placeholder: '' });
+  const parent = state.settings?.recentFolders?.[0] ? state.settings.recentFolders[0].replace(/[\\/][^\\/]+$/, '') : `${state.boot.home}\\Projects`;
+  const suggestion = () => {
+    const folderName = (nameInput.value.trim() || 'my-project').replace(/[<>:"/\\|?*]+/g, '-');
+    return `${parent}\\${folderName}`;
+  };
+  const updatePlaceholder = () => {
+    folderInput.placeholder = suggestion();
+  };
+  nameInput.addEventListener('input', updatePlaceholder);
+  updatePlaceholder();
+  const browse = h('button', {
+    class: 'btn',
+    type: 'button',
+    onClick: async () => {
+      const picked = await openFolderBrowser({ title: 'Choose the project folder', initial: folderInput.value.trim() || parent });
+      if (picked) {
+        folderInput.value = picked;
+        if (!nameInput.value.trim()) nameInput.value = basename(picked);
+      }
+    },
+  }, h('span', { html: icon('folder-open', 14) }), 'Browse…');
+  const create = async (close) => {
+    const folder = folderInput.value.trim() || suggestion();
+    try {
+      const result = await api.post('/api/projects', { folder, name: nameInput.value.trim(), create: true });
+      close();
+      // The sidebar reloads its projects now, also when the server's projects event does not arrive.
+      emit('projects');
+      await onCreated(result.project);
+    } catch (error) {
+      toastError(error);
+    }
+  };
+  const dialog = openModal({
+    title: 'New project',
+    body: h(
+      'div',
+      { class: 'stack' },
+      h('label', { class: 'stack', style: { gap: '4px' } }, h('span', { class: 'muted' }, 'Name'), nameInput),
+      h('label', { class: 'stack', style: { gap: '4px' } }, h('span', { class: 'muted' }, 'Folder'), h('div', { class: 'row' }, folderInput, browse)),
+      h('div', { class: 'faint', style: { fontSize: '12.5px' } }, 'Pick an existing folder, or type a new path and Caliope creates the folder. Leave it empty to use the suggested path.'),
+    ),
+    footer: (close) => [h('button', { class: 'btn', onClick: () => close() }, 'Cancel'), h('button', { class: 'btn primary', onClick: () => create(close) }, 'Create project')],
+  });
+  for (const input of [nameInput, folderInput]) {
+    input.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter') create(dialog.close);
+    });
+  }
 }
 
 let openMenuHandle = null;

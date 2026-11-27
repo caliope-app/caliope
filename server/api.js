@@ -554,6 +554,8 @@ export function createRoutes({ config, settings, store, client, auth, agents, le
         }
         const project = await projects.update(folder, { name: body.name || path.basename(folder) });
         await settings.rememberFolder(folder);
+        // The folder menus list the recent folders from the settings.
+        agents.hub.broadcast({ type: 'settings', settings: settings.get() });
         agents.hub.broadcast({ type: 'projects' });
         return { project };
       }),

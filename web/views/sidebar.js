@@ -4,7 +4,7 @@ import { icon } from '../lib/icons.js';
 import { api } from '../lib/api.js';
 import { state, on, emit, runtimeOf, savePreference, loadPreference } from '../lib/store.js';
 import * as actions from '../lib/actions.js';
-import { openMenu, openModal, openFolderBrowser, toastError } from './dialogs.js';
+import { openMenu, openNewProjectDialog } from './dialogs.js';
 
 export function mountSidebar(container) {
   let searchResults = [];
@@ -145,7 +145,7 @@ export function mountSidebar(container) {
       h('button', { class: state.sidebar.tab === 'archived' ? 'active' : '', onClick: () => setTab('archived') }, `Archived${archivedCount ? ` (${archivedCount})` : ''}`),
     );
     if (state.sidebar.tab === 'projects') {
-      tabsElement.append(tabs, h('span', { class: 'grow' }), h('button', { class: 'btn ghost small icon-only', title: 'New project', 'aria-label': 'New project', html: icon('folder-plus', 16), onClick: openNewProjectDialog }));
+      tabsElement.append(tabs, h('span', { class: 'grow' }), h('button', { class: 'btn ghost small icon-only', title: 'New project', 'aria-label': 'New project', html: icon('folder-plus', 16), onClick: () => openNewProjectDialog({ onCreated: (project) => actions.openProject(project.folder) }) }));
       return;
     }
     const groupButton = h('button', {
@@ -196,7 +196,7 @@ export function mountSidebar(container) {
           'div',
           { class: 'faint', style: { padding: '16px 10px', fontSize: '13px' } },
           'No projects yet. ',
-          h('button', { class: 'btn small', style: { marginTop: '8px' }, onClick: openNewProjectDialog }, h('span', { html: icon('folder-plus', 14) }), 'New project'),
+          h('button', { class: 'btn small', style: { marginTop: '8px' }, onClick: () => openNewProjectDialog({ onCreated: (project) => actions.openProject(project.folder) }) }, h('span', { html: icon('folder-plus', 14) }), 'New project'),
         ),
       );
       return;
@@ -467,57 +467,6 @@ export function mountSidebar(container) {
       scheduleRender();
     } catch {
       // The list still shows folders that have sessions.
-    }
-  }
-
-  /** New project: a name and a folder (an existing one, or a new path that gets created). */
-  function openNewProjectDialog() {
-    const nameInput = h('input', { class: 'input', placeholder: 'For example: Billing service', autofocus: true });
-    const folderInput = h('input', { class: 'input mono', placeholder: '' });
-    const parent = state.settings?.recentFolders?.[0] ? state.settings.recentFolders[0].replace(/[\\/][^\\/]+$/, '') : `${state.boot.home}\\Projects`;
-    const suggestion = () => `${parent}\\${(nameInput.value.trim() || 'my-project').replace(/[<>:"/\\|?*]+/g, '-')}`;
-    const updatePlaceholder = () => {
-      folderInput.placeholder = suggestion();
-    };
-    nameInput.addEventListener('input', updatePlaceholder);
-    updatePlaceholder();
-    const browse = h('button', {
-      class: 'btn',
-      type: 'button',
-      onClick: async () => {
-        const picked = await openFolderBrowser({ title: 'Choose the project folder', initial: folderInput.value.trim() || parent });
-        if (picked) {
-          folderInput.value = picked;
-          if (!nameInput.value.trim()) nameInput.value = basename(picked);
-        }
-      },
-    }, h('span', { html: icon('folder-open', 14) }), 'Browse…');
-    const create = async (close) => {
-      const folder = folderInput.value.trim() || suggestion();
-      try {
-        const result = await api.post('/api/projects', { folder, name: nameInput.value.trim(), create: true });
-        close();
-        await loadSavedProjects();
-        actions.openProject(result.project.folder);
-      } catch (error) {
-        toastError(error);
-      }
-    };
-    const dialog = openModal({
-      title: 'New project',
-      body: h(
-        'div',
-        { class: 'stack' },
-        h('label', { class: 'stack', style: { gap: '4px' } }, h('span', { class: 'muted' }, 'Name'), nameInput),
-        h('label', { class: 'stack', style: { gap: '4px' } }, h('span', { class: 'muted' }, 'Folder'), h('div', { class: 'row' }, folderInput, browse)),
-        h('div', { class: 'faint', style: { fontSize: '12.5px' } }, 'Pick an existing folder, or type a new path and Caliope creates the folder. Leave it empty to use the suggested path.'),
-      ),
-      footer: (close) => [h('button', { class: 'btn', onClick: () => close() }, 'Cancel'), h('button', { class: 'btn primary', onClick: () => create(close) }, 'Create project')],
-    });
-    for (const input of [nameInput, folderInput]) {
-      input.addEventListener('keydown', (event) => {
-        if (event.key === 'Enter') create(dialog.close);
-      });
     }
   }
 

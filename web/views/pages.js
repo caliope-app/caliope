@@ -5,7 +5,7 @@ import { api } from '../lib/api.js';
 import { state, on, modelById, loadPreference, savePreference } from '../lib/store.js';
 import * as actions from '../lib/actions.js';
 import { Composer, MODES, showHelp } from './composer.js';
-import { openMenu, openModal, openFolderBrowser, promptDialog, toast, toastError, confirmDialog } from './dialogs.js';
+import { openMenu, openModal, openFolderBrowser, openNewProjectDialog, promptDialog, toast, toastError, confirmDialog } from './dialogs.js';
 
 // ---------- New session ----------
 
@@ -39,6 +39,24 @@ export function mountNewSession(container) {
     },
     h('span', { html: icon('git-branch', 14) }),
     worktreeLabel,
+  );
+  // A new project's folder becomes the folder of this session.
+  const newProjectButton = h(
+    'button',
+    {
+      class: 'chip folder-chip',
+      type: 'button',
+      title: 'Create a project: a name and a folder',
+      onClick: () =>
+        openNewProjectDialog({
+          onCreated: (project) => {
+            setFolder(project.folder);
+            composer.focus();
+          },
+        }),
+    },
+    h('span', { html: icon('folder-plus', 14) }),
+    'New project',
   );
   const recentElement = h('div', { class: 'recent-list' });
 
@@ -98,7 +116,7 @@ export function mountNewSession(container) {
       'div',
       { class: 'new-session' },
       h('h1', {}, 'What should we build?'),
-      h('div', { class: 'folder-row' }, folderButton, worktreeButton),
+      h('div', { class: 'folder-row' }, folderButton, worktreeButton, newProjectButton),
       composer.element,
       h('div', { class: 'composer-hint' }, 'Shift+Tab switches mode (Plan uses the planning model) · / for commands'),
       recentElement,
